@@ -13,6 +13,7 @@
 #include "metadata_store.h"
 #include "mock_metadata_store.h"
 #include "ha/oplog/oplog_types.h"
+#include "ha/snapshot/batch_oplog/codec.h"
 #include "ha/standby_metadata_store.h"
 #include "types.h"
 #include "weight_management.h"
@@ -21,6 +22,17 @@
 using mooncake::test::MockMetadataStore;
 
 namespace mooncake::test {
+
+struct LegacyStandbySegmentInfo {
+    std::string segment_name;
+    std::string transport_endpoint;
+    uint64_t capacity{0};
+    bool is_memory_segment{false};
+    std::string file_path;
+
+    YLT_REFL(LegacyStandbySegmentInfo, segment_name, transport_endpoint,
+             capacity, is_memory_segment, file_path);
+};
 
 // Helper function to create a valid OpLogEntry with checksum
 // Uses the production checksum algorithm (XXH32).
@@ -611,6 +623,70 @@ TEST_F(OpLogApplierTest, TestApplySegmentMount) {
     EXPECT_EQ("seg1", info->segment_name);
     EXPECT_EQ(1024u, info->capacity);
     EXPECT_TRUE(info->is_memory_segment);
+}
+
+TEST_F(OpLogApplierTest, NoFSegmentSurvivesBatchSnapshotAndIdentityUnmount) {
+    NoFSegmentOp mount;
+    mount.segment_id = UUID{1, 2};
+    mount.owner_client_id = UUID{3, 4};
+    mount.segment_name = "nof-segment";
+    mount.transport_endpoint = "nvmeof-endpoint";
+    mount.base = 4 * 1024 * 1024;
+    mount.capacity = 8 * 1024 * 1024;
+    mount.allocator_type = BufferAllocatorType::OFFSET;
+    auto mount_bytes = struct_pack::serialize(mount);
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(MakeEntry(
+        1, OpType::NOF_SEGMENT_MOUNT, mount.transport_endpoint,
+        std::string(mount_bytes.begin(), mount_bytes.end()))));
+
+    auto encoded = EncodeBatchOpLogSnapshotSegments(
+        applier_->GetSegmentRegistry().GetAllSegments());
+    auto decoded = DecodeBatchOpLogSnapshotSegments(encoded);
+    ASSERT_TRUE(decoded.has_value());
+    ASSERT_EQ(decoded->size(), 1);
+    ASSERT_TRUE(decoded->front().nof.has_value());
+    EXPECT_EQ(decoded->front().nof->segment_id, mount.segment_id);
+    EXPECT_EQ(decoded->front().nof->owner_client_id, mount.owner_client_id);
+    EXPECT_EQ(decoded->front().nof->base, mount.base);
+    EXPECT_EQ(decoded->front().nof->capacity, mount.capacity);
+
+    mount.capacity *= 2;
+    auto update_bytes = struct_pack::serialize(mount);
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(MakeEntry(
+        2, OpType::NOF_SEGMENT_UPDATE, mount.transport_endpoint,
+        std::string(update_bytes.begin(), update_bytes.end()))));
+    auto updated = applier_->GetSegmentRegistry().GetSegment(
+        mount.transport_endpoint);
+    ASSERT_TRUE(updated.has_value());
+    EXPECT_EQ(updated->capacity, mount.capacity);
+
+    NoFSegmentUnmountOp stale{UUID{9, 9}, mount.transport_endpoint};
+    auto stale_bytes = struct_pack::serialize(stale);
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(MakeEntry(
+        3, OpType::NOF_SEGMENT_UNMOUNT, mount.transport_endpoint,
+        std::string(stale_bytes.begin(), stale_bytes.end()))));
+    EXPECT_TRUE(applier_->GetSegmentRegistry().HasSegment(
+        mount.transport_endpoint));
+
+    NoFSegmentUnmountOp unmount{mount.segment_id, mount.transport_endpoint};
+    auto unmount_bytes = struct_pack::serialize(unmount);
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(MakeEntry(
+        4, OpType::NOF_SEGMENT_UNMOUNT, mount.transport_endpoint,
+        std::string(unmount_bytes.begin(), unmount_bytes.end()))));
+    EXPECT_FALSE(applier_->GetSegmentRegistry().HasSegment(
+        mount.transport_endpoint));
+}
+
+TEST_F(OpLogApplierTest, BatchSnapshotReadsLegacySegmentRegistry) {
+    std::vector<LegacyStandbySegmentInfo> old_segments{
+        {"memory-segment", "memory-endpoint", 4096, true, ""}};
+    auto old_bytes = struct_pack::serialize<std::vector<uint8_t>>(
+        old_segments);
+    auto decoded = DecodeBatchOpLogSnapshotSegments(old_bytes);
+    ASSERT_TRUE(decoded.has_value());
+    ASSERT_EQ(decoded->size(), 1);
+    EXPECT_EQ(decoded->front().segment_name, "memory-segment");
+    EXPECT_FALSE(decoded->front().nof.has_value());
 }
 
 TEST_F(OpLogApplierTest, TestApplySegmentUnmount) {

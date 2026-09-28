@@ -102,6 +102,44 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         case OpType::SEGMENT_UPDATE:
             ApplySegmentUpdate(entry);
             break;
+        case OpType::NOF_SEGMENT_MOUNT:
+        case OpType::NOF_SEGMENT_UPDATE: {
+            NoFSegmentOp op;
+            if (struct_pack::deserialize_to(op, entry.payload) !=
+                    struct_pack::errc::ok ||
+                op.segment_id == UUID{0, 0} ||
+                op.owner_client_id == UUID{0, 0} ||
+                op.segment_name.empty() || op.transport_endpoint.empty() ||
+                op.capacity == 0 ||
+                (op.allocator_type != BufferAllocatorType::CACHELIB &&
+                 op.allocator_type != BufferAllocatorType::OFFSET)) {
+                LOG(ERROR) << "Invalid NoF segment OpLog payload for key "
+                           << entry.object_key;
+                return false;
+            }
+            StandbySegmentInfo info;
+            info.segment_name = op.segment_name;
+            info.transport_endpoint = op.transport_endpoint;
+            info.capacity = op.capacity;
+            info.nof = std::move(op);
+            segment_registry_.OnSegmentMount(info);
+            break;
+        }
+        case OpType::NOF_SEGMENT_UNMOUNT: {
+            NoFSegmentUnmountOp op;
+            if (struct_pack::deserialize_to(op, entry.payload) !=
+                struct_pack::errc::ok) {
+                LOG(ERROR) << "Invalid NoF unmount OpLog payload for key "
+                           << entry.object_key;
+                return false;
+            }
+            auto mounted = segment_registry_.GetSegment(op.transport_endpoint);
+            if (mounted && mounted->nof &&
+                mounted->nof->segment_id == op.segment_id) {
+                segment_registry_.OnSegmentUnmount(op.transport_endpoint);
+            }
+            break;
+        }
         case OpType::WEIGHT_METADATA_UPSERT:
             applied = ApplyWeightMetadataUpsert(entry);
             break;

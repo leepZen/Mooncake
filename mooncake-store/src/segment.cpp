@@ -830,8 +830,9 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
 }
 
 /* ScopedNoFSegmentAccess Implementation */
-ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
-                                               const UUID& client_id) {
+ErrorCode ScopedNoFSegmentAccess::MountSegment(
+    const NoFSegment& segment, const UUID& client_id,
+    std::shared_ptr<BufferAllocatorBase> restored_allocator) {
     const uintptr_t buffer = segment.base;
     const size_t size = segment.size;
 
@@ -842,7 +843,7 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    if (nof_segment_manager_->memory_allocator_ ==
+    if (!restored_allocator && nof_segment_manager_->memory_allocator_ ==
             BufferAllocatorType::CACHELIB &&
         (buffer % facebook::cachelib::Slab::kSize ||
          size % facebook::cachelib::Slab::kSize)) {
@@ -881,13 +882,17 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
         }
     }
 
-    auto created = CreateBufferAllocator(
-        nof_segment_manager_->memory_allocator_, segment.name, buffer, size,
-        segment.te_endpoint, ReplicaType::NOF_SSD);
-    if (!created) {
-        return created.error();
+    std::shared_ptr<BufferAllocatorBase> allocator =
+        std::move(restored_allocator);
+    if (!allocator) {
+        auto created = CreateBufferAllocator(
+            nof_segment_manager_->memory_allocator_, segment.name, buffer,
+            size, segment.te_endpoint, ReplicaType::NOF_SSD);
+        if (!created) {
+            return created.error();
+        }
+        allocator = std::move(*created);
     }
-    auto allocator = std::move(*created);
 
     allocator->AttachUsageTracker(nof_segment_manager_->usage_tracker_);
     auto registration = nof_segment_manager_->allocator_manager_.addAllocator(
