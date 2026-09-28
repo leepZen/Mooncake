@@ -22,6 +22,9 @@ enum class OpType : uint8_t {
     WEIGHT_METADATA_DELETE = 9,
     WEIGHT_LEASE_UPSERT = 10,
     WEIGHT_LEASE_DELETE = 11,
+    NOF_SEGMENT_MOUNT = 12,
+    NOF_SEGMENT_UNMOUNT = 13,
+    NOF_SEGMENT_UPDATE = 14,
     OP_TYPE_MAX,
 };
 
@@ -70,6 +73,27 @@ struct SegmentUpdateOp {
 
     YLT_REFL(SegmentUpdateOp, segment_name, transport_endpoint, capacity,
              is_memory_segment, file_path);
+};
+
+// Kept separate from the memory segment payload to preserve its wire format.
+struct NoFSegmentOp {
+    UUID segment_id{0, 0};
+    UUID owner_client_id{0, 0};
+    std::string segment_name;
+    std::string transport_endpoint;
+    uint64_t base{0};
+    uint64_t capacity{0};
+    BufferAllocatorType allocator_type{BufferAllocatorType::CACHELIB};
+
+    YLT_REFL(NoFSegmentOp, segment_id, owner_client_id, segment_name,
+             transport_endpoint, base, capacity, allocator_type);
+};
+
+struct NoFSegmentUnmountOp {
+    UUID segment_id{0, 0};
+    std::string transport_endpoint;
+
+    YLT_REFL(NoFSegmentUnmountOp, segment_id, transport_endpoint);
 };
 
 struct OpLogEntry {

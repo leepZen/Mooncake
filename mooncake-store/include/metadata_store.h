@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "ha/oplog/oplog_types.h"
 #include "replica.h"
 #include "types.h"
 #include "weight_metadata_store.h"
@@ -60,9 +61,11 @@ struct StandbySegmentInfo {
     uint64_t capacity{0};
     bool is_memory_segment{false};
     std::string file_path;  // empty for memory segments
+    // Versioned so existing batch snapshots remain readable.
+    struct_pack::compatible<NoFSegmentOp, 1> nof;
 
     YLT_REFL(StandbySegmentInfo, segment_name, transport_endpoint, capacity,
-             is_memory_segment, file_path);
+             is_memory_segment, file_path, nof);
 };
 
 /**
@@ -129,7 +132,7 @@ struct MetadataPayload {
 
 /**
  * Thread-safe registry of segments known to standby.
- * Maintained by applying SEGMENT_MOUNT/UNMOUNT/UPDATE OpLog events.
+ * Maintained by applying memory and NoF segment lifecycle OpLog events.
  * Used to reconstruct segment view after promotion.
  */
 class StandbySegmentRegistry {

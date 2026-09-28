@@ -798,19 +798,35 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
                << ", error=nof_pool_disabled";
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
-    ScopedNoFSegmentAccess nof_segment_access =
-        nof_segment_manager_.getNoFSegmentAccess();
-
+    // Keep the mount visible to Put only after its registry OpLog is queued.
+    std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     LOG(INFO) << "NoF segment mount: "
               << "client_id=" << client_id
               << ", action=mount_segment, segment_name=" << segment.name;
 
-    auto err = nof_segment_access.MountSegment(segment, client_id);
+    auto err = [&] {
+        auto access = nof_segment_manager_.getNoFSegmentAccess();
+        return access.MountSegment(segment, client_id);
+    }();
     if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
         // Return OK because this is an idempotent operation
         return {};
     } else if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
+    }
+    if (enable_oplog_ && ordered_oplog_writer_) {
+        NoFSegmentOp op;
+        op.segment_id = segment.id;
+        op.owner_client_id = client_id;
+        op.segment_name = segment.name;
+        op.transport_endpoint = segment.te_endpoint;
+        op.base = segment.base;
+        op.capacity = segment.size;
+        op.allocator_type = memory_allocator_type_;
+        auto bytes = struct_pack::serialize(op);
+        PersistSegmentOpForHAOrEnqueue(
+            "MountNoFSegment", OpType::NOF_SEGMENT_MOUNT, segment.te_endpoint,
+            std::string(bytes.begin(), bytes.end()));
     }
     return {};
 #endif
@@ -1194,11 +1210,42 @@ auto MasterService::ReMountNoFSegment(const std::vector<NoFSegment>& segments,
                << ", error=nof_pool_disabled";
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
-    ScopedNoFSegmentAccess nof_segment_access =
-        nof_segment_manager_.getNoFSegmentAccess();
-    ErrorCode err = nof_segment_access.ReMountSegment(segments, client_id);
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
+    std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+    std::vector<MountedNoFSegmentSnapshot> mounted;
+    {
+        auto access = nof_segment_manager_.getNoFSegmentAccess();
+        ErrorCode err = access.ReMountSegment(segments, client_id);
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
+        access.GetMountedSegments(mounted);
+    }
+    if (enable_oplog_ && ordered_oplog_writer_) {
+        for (const auto& segment : segments) {
+            auto found = std::find_if(
+                mounted.begin(), mounted.end(), [&](const auto& item) {
+                    return item.segment_id == segment.id &&
+                           item.client_id == client_id &&
+                           item.status == SegmentStatus::OK;
+                });
+            if (found == mounted.end()) {
+                continue;
+            }
+            const auto& authoritative = found->segment;
+            NoFSegmentOp op;
+            op.segment_id = authoritative.id;
+            op.owner_client_id = client_id;
+            op.segment_name = authoritative.name;
+            op.transport_endpoint = authoritative.te_endpoint;
+            op.base = authoritative.base;
+            op.capacity = authoritative.size;
+            op.allocator_type = memory_allocator_type_;
+            auto bytes = struct_pack::serialize(op);
+            PersistSegmentOpForHAOrEnqueue(
+                "ReMountNoFSegment", OpType::NOF_SEGMENT_MOUNT,
+                authoritative.te_endpoint,
+                std::string(bytes.begin(), bytes.end()));
+        }
     }
     return {};
 #endif
@@ -2877,6 +2924,7 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
     size_t metrics_dec_capacity = 0;  // to update the metrics
+    std::string te_endpoint;
 
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
@@ -2887,6 +2935,14 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
     {
         ScopedNoFSegmentAccess segment_access =
             nof_segment_manager_.getNoFSegmentAccess();
+        std::vector<MountedNoFSegmentSnapshot> mounted;
+        segment_access.GetMountedSegments(mounted);
+        for (const auto& item : mounted) {
+            if (item.segment_id == segment_id) {
+                te_endpoint = item.segment.te_endpoint;
+                break;
+            }
+        }
         ErrorCode err = segment_access.PrepareUnmountSegment(
             segment_id, metrics_dec_capacity);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
@@ -2913,6 +2969,13 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
     {
         std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
         nof_heartbeat_states_.erase(segment_id);
+    }
+    if (enable_oplog_ && ordered_oplog_writer_ && !te_endpoint.empty()) {
+        NoFSegmentUnmountOp op{segment_id, te_endpoint};
+        auto bytes = struct_pack::serialize(op);
+        PersistSegmentOpForHAOrEnqueue("UnmountNoFSegment",
+                                       OpType::NOF_SEGMENT_UNMOUNT, te_endpoint,
+                                       std::string(bytes.begin(), bytes.end()));
     }
     return {};
 #endif
@@ -3699,15 +3762,42 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     std::vector<StandbySegmentInfo> restored_memory_segments;
     std::unordered_map<std::string, const StandbySegmentInfo*>
         memory_segments_by_alias;
+    std::unordered_map<std::string, const StandbySegmentInfo*>
+        nof_segments_by_endpoint;
+    std::unordered_set<UUID, boost::hash<UUID>> nof_segment_ids;
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
         restored_allocators;
     std::unordered_set<std::string> restored_invalid_endpoints;
     for (const auto& seg : segments) {
+        if (seg.nof) {
+            const auto& nof = *seg.nof;
+            if (nof.segment_id == UUID{0, 0} ||
+                nof.owner_client_id == UUID{0, 0} || nof.segment_name.empty() ||
+                nof.transport_endpoint.empty() || nof.capacity == 0 ||
+                (nof.allocator_type != BufferAllocatorType::CACHELIB &&
+                 nof.allocator_type != BufferAllocatorType::OFFSET) ||
+                nof.base >
+                    std::numeric_limits<uintptr_t>::max() - nof.capacity ||
+                nof.segment_name != seg.segment_name ||
+                nof.transport_endpoint != seg.transport_endpoint ||
+                nof.capacity != seg.capacity ||
+                memory_segments_by_alias.contains(seg.transport_endpoint) ||
+                !nof_segment_ids.insert(nof.segment_id).second ||
+                !nof_segments_by_endpoint.emplace(seg.transport_endpoint, &seg)
+                     .second) {
+                LOG(ERROR) << "RestoreFromStandbySnapshot: invalid NoF segment "
+                           << seg.segment_name;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            restored_invalid_endpoints.insert(seg.transport_endpoint);
+            continue;
+        }
         if (!seg.is_memory_segment) {
             continue;
         }
         if (seg.segment_name.empty() || seg.transport_endpoint.empty() ||
-            seg.capacity == 0) {
+            seg.capacity == 0 ||
+            nof_segments_by_endpoint.contains(seg.transport_endpoint)) {
             LOG(ERROR) << "RestoreFromStandbySnapshot: invalid memory segment "
                        << "name=" << seg.segment_name
                        << ", endpoint=" << seg.transport_endpoint
@@ -3765,6 +3855,15 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         legacy_memory_ranges;
     std::unordered_map<const StandbySegmentInfo*, std::map<uintptr_t, uint64_t>>
         bounded_memory_ranges;
+    std::unordered_map<const StandbySegmentInfo*, std::map<uintptr_t, uint64_t>>
+        nof_ranges;
+    std::unordered_map<const StandbySegmentInfo*,
+                       std::vector<AllocatedBuffer::Descriptor>>
+        nof_descriptors;
+    std::unordered_map<const StandbySegmentInfo*, std::vector<Replica*>>
+        nof_replicas;
+    std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
+        nof_dummy_allocators;
     std::unordered_map<std::string, uint64_t> restored_accounted_memory_bytes;
     size_t restored_object_count = 0;
     size_t dropped_stale_replica_count = 0;
@@ -3899,15 +3998,40 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                 } else if (desc.is_nof_replica()) {
                     const auto& buffer =
                         desc.get_nof_descriptor().buffer_descriptor;
+                    auto segment_it = nof_segments_by_endpoint.find(
+                        buffer.transport_endpoint_);
+                    if (segment_it == nof_segments_by_endpoint.end()) {
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                    const auto* segment = segment_it->second;
+                    const auto& nof = *segment->nof;
                     if (buffer.size_ != standby_meta.size ||
-                        buffer.size_ == 0) {
+                        buffer.size_ == 0 ||
+                        buffer.buffer_address_ < nof.base ||
+                        buffer.buffer_address_ - nof.base >= nof.capacity ||
+                        buffer.size_ > nof.capacity - (buffer.buffer_address_ -
+                                                       nof.base)) {
                         LOG(ERROR) << "RestoreFromStandbySnapshot: invalid NoF "
                                    << "descriptor, tenant=" << tenant_id.value()
                                    << ", key=" << user_key;
                         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                     }
+                    if (desc.status == ReplicaStatus::COMPLETE) {
+                        auto& ranges = nof_ranges[segment];
+                        auto next = ranges.lower_bound(buffer.buffer_address_);
+                        const uintptr_t end =
+                            buffer.buffer_address_ + buffer.size_;
+                        if ((next != ranges.end() && end > next->first) ||
+                            (next != ranges.begin() &&
+                             std::prev(next)->first + std::prev(next)->second >
+                                 buffer.buffer_address_)) {
+                            return tl::make_unexpected(
+                                ErrorCode::INVALID_PARAMS);
+                        }
+                        ranges.emplace(buffer.buffer_address_, buffer.size_);
+                    }
                     auto& alloc =
-                        restored_allocators[buffer.transport_endpoint_];
+                        nof_dummy_allocators[buffer.transport_endpoint_];
                     if (!alloc) {
                         alloc = std::make_shared<DummyBufferAllocator>(
                             buffer.transport_endpoint_,
@@ -4034,6 +4158,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     const auto prev_standby_memory_segments = standby_memory_segments_;
     const auto prev_standby_allocator_keepalive = standby_allocator_keepalive_;
     const auto prev_invalid_replica_endpoints = invalid_replica_endpoints_;
+    std::vector<std::pair<UUID, UUID>> restored_nof_segments;
 
     // A failed restore leaves nothing behind: installed keys go back out
     // through the canonical removal, bookkeeping returns to its pre-restore
@@ -4045,6 +4170,14 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             MetadataAccessorRW accessor(this, tenant, ref);
             if (accessor.IsPublished()) {
                 accessor.Erase();
+            }
+        }
+        for (const auto& [segment_id, owner] : restored_nof_segments) {
+            auto access = nof_segment_manager_.getNoFSegmentAccess();
+            size_t capacity = 0;
+            if (access.PrepareUnmountSegment(segment_id, capacity) ==
+                ErrorCode::OK) {
+                access.CommitUnmountSegment(segment_id, owner, capacity);
             }
         }
         standby_accounted_memory_bytes_ = prev_standby_accounted_memory_bytes;
@@ -4072,6 +4205,135 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         // repair step fails the restore.
         client_liveness_records_.emplace(client_id, record);
         MasterMetricManager::instance().client_liveness_record_created();
+    }
+
+    // Both restore paths publish through PublishRestoredObjects. Collect NoF
+    // replicas from those publications so legacy snapshots and chunked
+    // promotions bind the same live extents.
+    for (const auto& [tenant, ref] : installed) {
+        bool valid = true;
+        {
+            MetadataAccessorRW accessor(this, tenant, ref);
+            accessor.Get().VisitReplicas(
+                [](const Replica& replica) { return replica.is_nof_replica(); },
+                [&](Replica& replica) {
+                    if (!valid) {
+                        return;
+                    }
+                    auto descriptor = replica.get_descriptor()
+                                          .get_nof_descriptor()
+                                          .buffer_descriptor;
+                    const auto found = nof_segments_by_endpoint.find(
+                        descriptor.transport_endpoint_);
+                    if (found == nof_segments_by_endpoint.end()) {
+                        valid = false;
+                        return;
+                    }
+                    const auto* segment = found->second;
+                    const auto& info = *segment->nof;
+                    if (descriptor.size_ !=
+                            accessor.Get().GetPart(0).length() ||
+                        descriptor.size_ == 0 ||
+                        descriptor.buffer_address_ < info.base ||
+                        descriptor.buffer_address_ - info.base >=
+                            info.capacity ||
+                        descriptor.size_ >
+                            info.capacity -
+                                (descriptor.buffer_address_ - info.base)) {
+                        valid = false;
+                        return;
+                    }
+                    if (replica.status() != ReplicaStatus::COMPLETE) {
+                        return;
+                    }
+                    if (legacy_objects) {
+                        auto& ranges = nof_ranges[segment];
+                        auto next =
+                            ranges.lower_bound(descriptor.buffer_address_);
+                        const uintptr_t end =
+                            descriptor.buffer_address_ + descriptor.size_;
+                        if ((next != ranges.end() && end > next->first) ||
+                            (next != ranges.begin() &&
+                             std::prev(next)->first + std::prev(next)->second >
+                                 descriptor.buffer_address_)) {
+                            valid = false;
+                            return;
+                        }
+                        ranges.emplace(descriptor.buffer_address_,
+                                       descriptor.size_);
+                    }
+                    nof_descriptors[segment].push_back(std::move(descriptor));
+                    nof_replicas[segment].push_back(&replica);
+                });
+        }
+        if (!valid) {
+            rollback_restored_state();
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    // NoF has no client remount callback. Rebuild and bind every live extent
+    // after the final object chunk has been applied.
+    for (const auto& [endpoint, segment] : nof_segments_by_endpoint) {
+        const auto& info = *segment->nof;
+        NoFSegment nof_segment;
+        nof_segment.id = info.segment_id;
+        nof_segment.name = info.segment_name;
+        nof_segment.te_endpoint = endpoint;
+        nof_segment.base = info.base;
+        nof_segment.size = info.capacity;
+        std::shared_ptr<BufferAllocatorBase> allocator;
+        std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+        auto& descriptors = nof_descriptors[segment];
+        if (!descriptors.empty()) {
+            std::vector<LiveAllocation> allocations;
+            allocations.reserve(descriptors.size());
+            for (const auto& descriptor : descriptors) {
+                allocations.push_back(
+                    {descriptor.buffer_address_ - info.base, descriptor.size_});
+            }
+            auto imported = ImportOffsetBufferAllocator(
+                info.segment_name, info.base, info.capacity, endpoint,
+                allocations, ReplicaType::NOF_SSD);
+            if (!imported) {
+                rollback_restored_state();
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            allocator = std::move(imported->allocator);
+            buffers = std::move(imported->buffers);
+        } else {
+            auto created = CreateBufferAllocator(
+                info.allocator_type, info.segment_name, info.base,
+                info.capacity, endpoint, ReplicaType::NOF_SSD);
+            if (!created) {
+                rollback_restored_state();
+                return tl::make_unexpected(created.error());
+            }
+            allocator = std::move(*created);
+        }
+        const auto err = [&] {
+            auto access = nof_segment_manager_.getNoFSegmentAccess();
+            return access.MountSegment(nof_segment, info.owner_client_id,
+                                       std::move(allocator));
+        }();
+        if (err == ErrorCode::OK) {
+            restored_nof_segments.emplace_back(info.segment_id,
+                                               info.owner_client_id);
+        }
+        if (err != ErrorCode::OK ||
+            buffers.size() != nof_replicas[segment].size()) {
+            rollback_restored_state();
+            return tl::make_unexpected(
+                err == ErrorCode::OK ? ErrorCode::INTERNAL_ERROR : err);
+        }
+        for (size_t i = 0; i < buffers.size(); ++i) {
+            if (!nof_replicas[segment][i]->replace_nof_buffer(
+                    std::move(buffers[i]))) {
+                rollback_restored_state();
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+        }
+        invalid_replica_endpoints_.erase(endpoint);
     }
 
     if (max_live_id != 0) {
@@ -11361,6 +11623,16 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
     // restart.
     if (MasterNofInitiator())
         MasterNofInitiator()->CloseSegment(snapshot.segment.te_endpoint);
+    if (enable_oplog_ && ordered_oplog_writer_ &&
+        !snapshot.segment.te_endpoint.empty()) {
+        NoFSegmentUnmountOp op{snapshot.segment_id,
+                               snapshot.segment.te_endpoint};
+        auto bytes = struct_pack::serialize(op);
+        PersistSegmentOpForHAOrEnqueue("NofHeartbeatUnmount",
+                                       OpType::NOF_SEGMENT_UNMOUNT,
+                                       snapshot.segment.te_endpoint,
+                                       std::string(bytes.begin(), bytes.end()));
+    }
     MasterMetricManager::instance()
         .inc_nof_segments_unmounted_by_heartbeat_total();
     LOG(INFO) << "segment_id=" << snapshot.segment_id

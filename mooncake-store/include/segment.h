@@ -243,7 +243,9 @@ class ScopedNoFSegmentAccess {
     /**
      * @brief Mount a segment
      */
-    ErrorCode MountSegment(const NoFSegment& segment, const UUID& client_id);
+    ErrorCode MountSegment(
+        const NoFSegment& segment, const UUID& client_id,
+        std::shared_ptr<BufferAllocatorBase> restored_allocator = nullptr);
 
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the

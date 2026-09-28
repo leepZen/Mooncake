@@ -1436,6 +1436,70 @@ TEST_F(MasterServiceHATest,
     EXPECT_EQ(1u, standby.GetMetadataCount());
 }
 
+TEST_F(MasterServiceHATest, BatchPromotionRestoresNoFAcrossChunks) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(false)
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    constexpr uintptr_t base = 0x12000000;
+    const std::string endpoint = "batch_nof_endpoint";
+    StandbySegmentInfo segment;
+    segment.segment_name = "batch_nof_segment";
+    segment.transport_endpoint = endpoint;
+    segment.capacity = 1024 * 1024;
+    NoFSegmentOp nof;
+    nof.segment_id = generate_uuid();
+    nof.owner_client_id = generate_uuid();
+    nof.segment_name = segment.segment_name;
+    nof.transport_endpoint = endpoint;
+    nof.base = base;
+    nof.capacity = segment.capacity;
+    nof.allocator_type = BufferAllocatorType::OFFSET;
+    segment.nof = nof;
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    for (int index = 0; index < 2; ++index) {
+        StandbyObjectMetadata metadata;
+        metadata.client_id = generate_uuid();
+        metadata.size = 4096;
+        Replica::Descriptor replica;
+        replica.id = 61 + index;
+        replica.status = ReplicaStatus::COMPLETE;
+        NoFDescriptor descriptor;
+        descriptor.buffer_descriptor = {
+            4096, base + static_cast<uintptr_t>(index) * 4096, "nvmeof",
+            endpoint};
+        replica.descriptor_variant = std::move(descriptor);
+        metadata.replicas.push_back(std::move(replica));
+        ASSERT_TRUE(source->PutMetadata(kDefaultTenant.value(),
+                                        "batch_nof_" + std::to_string(index),
+                                        metadata));
+    }
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {segment};
+    handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
+    handoff.max_replica_id = 62;
+
+    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1)
+                    .has_value());
+    auto owners = service.GetNoFSegmentsByName(segment.segment_name);
+    ASSERT_TRUE(owners.has_value());
+    ASSERT_EQ(owners->size(), 1);
+    EXPECT_EQ(owners->front().segment_id, nof.segment_id);
+    EXPECT_EQ(owners->front().client_id, nof.owner_client_id);
+    auto usage = service.GetStorageUsageSnapshot();
+    EXPECT_EQ(usage.nof.used_bytes, 8192);
+    EXPECT_EQ(usage.nof.capacity_bytes, segment.capacity);
+    for (int index = 0; index < 2; ++index) {
+        auto result = service.GetReplicaList(
+            "batch_nof_" + std::to_string(index), kDefaultTenant);
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result->replicas.size(), 1);
+        EXPECT_TRUE(result->replicas.front().is_nof_replica());
+    }
+}
+
 TEST_F(MasterServiceHATest, RestoreRejectsInvalidReplicaIds) {
     const std::string endpoint = "standby_invalid_replica_id_segment";
     for (const ReplicaID id :
@@ -3556,8 +3620,10 @@ TEST_F(MasterServiceHATest, RemountRejectsMismatchedExistingSegmentIdentity) {
 }
 
 TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesNoFBufferDescriptor) {
-    MasterService service(
-        MasterServiceConfig::builder().set_enable_ha(false).build());
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(false)
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
 
     const std::string endpoint = "standby_restore_nof_endpoint";
     const size_t size = 4096;
@@ -3576,8 +3642,22 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesNoFBufferDescriptor) {
     StandbyObjectEntry object{kDefaultTenant.value(), "standby_restore_nof_key",
                               std::move(metadata)};
 
+    StandbySegmentInfo segment;
+    segment.segment_name = "standby_restore_nof_segment";
+    segment.transport_endpoint = endpoint;
+    segment.capacity = 1024 * 1024;
+    NoFSegmentOp nof;
+    nof.segment_id = generate_uuid();
+    nof.owner_client_id = generate_uuid();
+    nof.segment_name = segment.segment_name;
+    nof.transport_endpoint = endpoint;
+    nof.base = address;
+    nof.capacity = segment.capacity;
+    nof.allocator_type = BufferAllocatorType::OFFSET;
+    segment.nof = nof;
+
     ASSERT_TRUE(
-        service.RestoreFromStandbySnapshot({object}, 7, {}).has_value());
+        service.RestoreFromStandbySnapshot({object}, 7, {segment}).has_value());
 
     auto replicas = ReplicaDescriptorsForTesting(service, kDefaultTenant,
                                                  "standby_restore_nof_key");
