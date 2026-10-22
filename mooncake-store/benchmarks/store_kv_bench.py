@@ -1365,6 +1365,10 @@ class BenchmarkRunner:
 
     def _maybe_prepare_dataset(self) -> Optional[PhaseStats]:
         if self.args.prepare_mode == "none":
+            if self.args.scenario == "read_perf":
+                # Read existing keys without issuing prepare writes.
+                start = self.args.object_id_start
+                self.dataset.mark_prepared(range(start, start + self._prepare_budget()))
             return None
         if self.args.prepare_mode == "write" or self.args.scenario in {
             "read_perf",
