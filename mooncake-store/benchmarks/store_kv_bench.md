@@ -192,6 +192,15 @@ necessarily mean a physical disk read.
   alignment for the explicitly write-involved scenarios, but does not reject
   an unaligned `read_perf` value before its automatic prepare phase.
 
+To verify existing data without writing it again, use
+`--scenario read_perf --prepare-mode none --verify --pattern 0xcd`.
+This reads the consecutive object IDs starting at `object-id-start`, using
+`prepare-objects` as the count when it is positive, otherwise `nr-objects`.
+Match `key-prefix`, `key-size`, `value-size`, and `pattern` to the original
+write. With `--runtime 0` (the default), each object is read once; a positive
+runtime loops over the same dataset until the time limit. Missing objects or
+values that fail verification cause a nonzero exit code.
+
 ## Phase Gap
 
 Phase gaps are used when an external tool needs time to inject a fault or do an

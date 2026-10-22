@@ -319,6 +319,151 @@ class StoreSessionMetadataTest(unittest.TestCase):
         self.assertEqual(summary["journal_records"], 5)
 
 
+class ReadOnlyDatasetTest(unittest.TestCase):
+    def make_runner(self, *options):
+        args = bench.build_parser().parse_args(
+            [
+                "--scenario=read_perf",
+                "--prepare-mode=none",
+                "--verify",
+                "--pattern=0xcd",
+                "--key-prefix=nofonly",
+                "--value-size=65536",
+                *options,
+            ]
+        )
+        runner = bench.BenchmarkRunner(args)
+        store = Mock()
+        store.get.return_value = b"\xcd" * args.value_size
+        store.get_batch.side_effect = lambda keys: [store.get.return_value] * len(keys)
+        runner._sessions = [
+            bench.StoreSession(args, lane, runner.payload_factory, store)
+            for lane in range(runner.lane_count)
+        ]
+        return runner, store
+
+    def test_fixed_count_reads_existing_keys_without_writes(self):
+        for nr_objects, prepare_objects, start, batch_size, numjobs in (
+            (1600, 0, 0, 2, 1),
+            (5, 0, 7, 1, 1),
+            (99, 5, 11, 2, 4),
+        ):
+            with self.subTest(
+                nr_objects=nr_objects,
+                prepare_objects=prepare_objects,
+                start=start,
+                batch_size=batch_size,
+                numjobs=numjobs,
+            ):
+                runner, store = self.make_runner(
+                    f"--nr-objects={nr_objects}",
+                    f"--prepare-objects={prepare_objects}",
+                    f"--object-id-start={start}",
+                    f"--batch-size={batch_size}",
+                    f"--numjobs={numjobs}",
+                )
+                phases = runner.run()
+
+                count = prepare_objects or nr_objects
+                expected_keys = [
+                    f"nofo{object_id:016d}" for object_id in range(start, start + count)
+                ]
+                read_keys = [call.args[0] for call in store.get.call_args_list]
+                read_keys.extend(
+                    key
+                    for call in store.get_batch.call_args_list
+                    for key in call.args[0]
+                )
+                self.assertEqual(sorted(read_keys), expected_keys)
+                self.assertEqual([phase.name for phase in phases], ["read_perf"])
+                self.assertEqual(
+                    phases[0].requests, (count + batch_size - 1) // batch_size
+                )
+                self.assertEqual(phases[0].successful_kvs, count)
+                self.assertEqual(phases[0].failed_kvs, 0)
+                self.assertEqual(phases[0].bytes_processed, count * 65536)
+                store.put.assert_not_called()
+                store.put_batch.assert_not_called()
+
+    def test_time_based_reads_loop_over_existing_keys_without_writes(self):
+        runner, store = self.make_runner(
+            "--nr-objects=3", "--batch-size=2", "--runtime=1"
+        )
+        now = [100.0]
+
+        def get_batch(keys):
+            now[0] += 0.25
+            return [store.get.return_value] * len(keys)
+
+        store.get_batch.side_effect = get_batch
+        with patch.object(bench.time, "time", side_effect=lambda: now[0]):
+            phases = runner.run()
+
+        read_keys = [
+            key for call in store.get_batch.call_args_list for key in call.args[0]
+        ]
+        self.assertEqual(
+            read_keys,
+            [f"nofo{object_id:016d}" for object_id in (0, 1, 2, 0, 1, 2, 0, 1)],
+        )
+        self.assertEqual(phases[0].successful_kvs, 8)
+        self.assertEqual(phases[0].failed_kvs, 0)
+        store.put.assert_not_called()
+        store.put_batch.assert_not_called()
+
+    def test_cli_reports_missing_or_invalid_existing_values(self):
+        valid = b"\xcd" * 4096
+        for value, expected_code in (
+            (b"", 21),
+            (b"\xab" * 4096, 20),
+            (valid[:-1], 20),
+        ):
+            with self.subTest(value_size=len(value), expected_code=expected_code):
+                store = Mock()
+                store.setup.return_value = 0
+                store.get_batch.return_value = [valid, value]
+                argv = [
+                    "store_kv_bench.py",
+                    "--scenario=read_perf",
+                    "--prepare-mode=none",
+                    "--verify",
+                    "--pattern=0xcd",
+                    "--nr-objects=2",
+                    "--batch-size=2",
+                ]
+                with (
+                    patch.object(bench, "MooncakeDistributedStore", return_value=store),
+                    patch.object(sys, "argv", argv),
+                ):
+                    self.assertEqual(bench.main(), expected_code)
+                store.get_batch.assert_called_once_with(
+                    ["kvbe0000000000000000", "kvbe0000000000000001"]
+                )
+                store.put.assert_not_called()
+                store.put_batch.assert_not_called()
+                store.close.assert_called_once()
+
+    def test_prepare_modes_still_write_before_reading(self):
+        for prepare_mode in ("auto", "write"):
+            with self.subTest(prepare_mode=prepare_mode):
+                runner, store = self.make_runner(
+                    f"--prepare-mode={prepare_mode}",
+                    "--nr-objects=3",
+                    "--batch-size=2",
+                )
+                store.put_batch.return_value = 0
+                phases = runner.run()
+
+                self.assertEqual(
+                    [phase.name for phase in phases], ["prepare_write", "read_perf"]
+                )
+                self.assertEqual(store.put_batch.call_count, 2)
+                self.assertEqual(store.get_batch.call_count, 2)
+                for phase in phases:
+                    self.assertEqual(phase.successful_kvs, 3)
+                    self.assertEqual(phase.failed_kvs, 0)
+
+
 class RemoveExistenceErrorTest(unittest.TestCase):
     def test_remove_requires_a_successful_absence_check(self):
         args = bench.build_parser().parse_args(["--scenario=mixed_metadata"])
