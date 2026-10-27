@@ -1193,7 +1193,9 @@ class MasterService {
         void Remove(const std::string& scoped_key);
         void RemoveIfMatches(const std::string& scoped_key,
                              const TimePoint& deadline);
-        std::vector<Entry> PopExpired(const TimePoint& now);
+        std::vector<Entry> PopExpired(
+            const TimePoint& now,
+            size_t limit = std::numeric_limits<size_t>::max());
         void Clear();
 
        private:
@@ -1220,6 +1222,28 @@ class MasterService {
     };
 
     mutable SoftPinDeadlineIndex soft_pin_deadline_index_;
+
+    // A NoF-only object whose soft pin deadline has expired and which is a
+    // candidate for the background TTL reclaim pass.
+    struct SoftPinReclaimCandidate {
+        TenantId tenant_id;
+        std::string key;
+    };
+    static constexpr size_t kSoftPinTtlReclaimBatchSize = 1024;
+    std::mutex soft_pin_reclaim_queue_mutex_;
+    std::queue<SoftPinReclaimCandidate> soft_pin_reclaim_queue_
+        GUARDED_BY(soft_pin_reclaim_queue_mutex_);
+    // Set when the cleanup pass queued candidates, so the eviction thread picks
+    // them up on its next wake-up instead of waiting for allocation pressure.
+    std::atomic<bool> need_soft_pin_reclaim_{false};
+    // Candidates whose eviction was blocked by a hard pin or a live lease.
+    // Only touched by the eviction thread.
+    std::unordered_map<std::string, SoftPinReclaimCandidate>
+        soft_pin_deferred_evals_;
+
+    // Reclaims NoF-only objects whose soft pin deadline has expired. Queued by
+    // CleanupExpiredSoftPins, drained by EvictionThreadFunc.
+    void EvictSoftPinExpired(const std::chrono::system_clock::time_point& now);
 
     static bool HasCompletedMemoryCacheReplica(const ObjectMetadata& metadata);
     static bool HasCompletedDiskCacheReplica(const ObjectMetadata& metadata);
@@ -1749,6 +1773,9 @@ class MasterService {
     const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
     const uint64_t max_kv_soft_pin_ttl_;      // in milliseconds
     const bool allow_evict_soft_pinned_objects_;
+    // When true, a soft pin whose TTL expired makes a NoF-only object
+    // immediately reclaimable instead of waiting for eviction pressure.
+    const bool enable_soft_pin_ttl_reclaim_;
 
     // Eviction related members
     std::atomic<bool> need_mem_eviction_{
