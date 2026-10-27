@@ -271,6 +271,18 @@ struct ObjectMetadata {
         return std::ranges::any_of(GetPart(0).replicas(), pred_fn);
     }
 
+    // Whether the object is backed by NoF replicas only, with no memory or disk
+    // replica keeping it resident. Such an object can be reclaimed as soon as
+    // its soft pin expires.
+    bool IsNoFOnly() const {
+        return HasReplica([](const Replica& replica) {
+                   return replica.is_nof_replica();
+               }) &&
+               !HasReplica([](const Replica& replica) {
+                   return !replica.is_nof_replica();
+               });
+    }
+
     bool AllReplicas(const std::function<bool(const Replica&)>& pred_fn) const {
         return std::ranges::all_of(GetPart(0).replicas(), pred_fn);
     }

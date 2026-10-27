@@ -222,6 +222,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
       max_kv_soft_pin_ttl_(config.max_kv_soft_pin_ttl),
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
+      enable_soft_pin_ttl_reclaim_(config.enable_soft_pin_ttl_reclaim),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
       tenant_eviction_high_watermark_ratio_(
@@ -2340,10 +2341,12 @@ void MasterService::SoftPinDeadlineIndex::RemoveIfMatches(
 }
 
 std::vector<MasterService::SoftPinDeadlineIndex::Entry>
-MasterService::SoftPinDeadlineIndex::PopExpired(const TimePoint& now) {
+MasterService::SoftPinDeadlineIndex::PopExpired(const TimePoint& now,
+                                                size_t limit) {
     std::vector<Entry> expired;
     std::lock_guard lock(mutex_);
-    while (!heap_.empty() && heap_.top().deadline <= now) {
+    while (!heap_.empty() && heap_.top().deadline <= now &&
+           expired.size() < limit) {
         Entry entry = heap_.top();
         heap_.pop();
 
@@ -2478,7 +2481,13 @@ bool MasterService::IsSoftPinActive(
 
 void MasterService::CleanupExpiredSoftPins(
     const std::chrono::system_clock::time_point& now) {
-    auto expired_entries = soft_pin_deadline_index_.PopExpired(now);
+    // While TTL reclaim is enabled the batch is bounded so a large expiry wave
+    // cannot stall the cleanup thread; the remainder is drained on later
+    // rounds.
+    const size_t limit = enable_soft_pin_ttl_reclaim_
+                             ? kSoftPinTtlReclaimBatchSize
+                             : std::numeric_limits<size_t>::max();
+    auto expired_entries = soft_pin_deadline_index_.PopExpired(now, limit);
 
     // Each deadline is resolved on its own, under the key the scoped key
     // names: the key may have been republished since, and only the deadline
@@ -2486,12 +2495,29 @@ void MasterService::CleanupExpiredSoftPins(
     int expired_count = 0;
     for (const auto& entry : expired_entries) {
         auto [tenant_id, key] = TenantId::ParseScopedKey(entry.scoped_key);
-        MetadataAccessorRO accessor(
-            this, ObjectIdentity{std::move(tenant_id), std::move(key)});
-        if (accessor.IsPublished() &&
-            accessor.Get().ExpireSoftPinIfDeadlineMatches(entry.deadline,
-                                                          now)) {
+        std::optional<SoftPinReclaimCandidate> candidate;
+        if (enable_soft_pin_ttl_reclaim_) {
+            candidate.emplace(SoftPinReclaimCandidate{tenant_id, key});
+        }
+        bool nof_only = false;
+        {
+            MetadataAccessorRO accessor(
+                this, ObjectIdentity{std::move(tenant_id), std::move(key)});
+            if (!accessor.IsPublished() ||
+                !accessor.Get().ExpireSoftPinIfDeadlineMatches(entry.deadline,
+                                                               now)) {
+                continue;
+            }
             ++expired_count;
+            // A NoF-only object is not kept resident by any memory or disk
+            // replica, so the eviction thread can reclaim it without waiting
+            // for allocation pressure.
+            nof_only = candidate && accessor.Get().IsNoFOnly();
+        }
+        if (nof_only) {
+            std::lock_guard lock(soft_pin_reclaim_queue_mutex_);
+            soft_pin_reclaim_queue_.push(std::move(*candidate));
+            need_soft_pin_reclaim_.store(true, std::memory_order_relaxed);
         }
     }
     if (expired_count > 0) {
@@ -9969,6 +9995,13 @@ void MasterService::EvictionThreadFunc() {
         }
 #endif
 
+        // NoF soft-pin TTL reclaim. Independent of allocation pressure: the
+        // cleanup pass queues NoF-only objects whose soft pin just expired.
+        if (need_soft_pin_reclaim_.load(std::memory_order_relaxed) ||
+            !soft_pin_deferred_evals_.empty()) {
+            EvictSoftPinExpired(now);
+        }
+
         if (dfs_allocator_ && dfs_allocator_->IsEvictionEnabled()) {
             const auto steady_now = std::chrono::steady_clock::now();
             if (steady_now >= next_dfs_eviction_time) {
@@ -11481,6 +11514,133 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
     VLOG(1) << "action=evict_nof_replicas"
             << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
+}
+
+void MasterService::EvictSoftPinExpired(
+    const std::chrono::system_clock::time_point& now) {
+    std::vector<SoftPinReclaimCandidate> candidates;
+    {
+        std::lock_guard lock(soft_pin_reclaim_queue_mutex_);
+        candidates.reserve(soft_pin_reclaim_queue_.size());
+        while (!soft_pin_reclaim_queue_.empty()) {
+            candidates.push_back(std::move(soft_pin_reclaim_queue_.front()));
+            soft_pin_reclaim_queue_.pop();
+        }
+        need_soft_pin_reclaim_.store(false, std::memory_order_relaxed);
+    }
+
+    // Fold in the candidates deferred from the previous cycle; the eviction
+    // thread cadence acts as their retry timer.
+    for (auto& entry : soft_pin_deferred_evals_) {
+        candidates.push_back(std::move(entry.second));
+    }
+    soft_pin_deferred_evals_.clear();
+
+    if (candidates.empty()) {
+        return;
+    }
+
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+
+    const auto is_evictable_nof_replica = [](const Replica& replica) {
+        return replica.is_nof_replica() && replica.is_completed() &&
+               replica.get_refcnt() == 0;
+    };
+
+    for (const auto& candidate : candidates) {
+        const auto& tenant_id = candidate.tenant_id;
+        const auto& key = candidate.key;
+
+        MetadataAccessorRW accessor(this, ObjectIdentity{tenant_id, key},
+                                     MetadataAccessorRW::AsIs{});
+        if (!accessor.IsPublished()) {
+            continue;
+        }
+        auto& metadata = accessor.Get();
+
+        // The screening-to-eviction gap can include a concurrent Get lease
+        // renewal, a re-pin, or new replicas of another type, so every gate is
+        // re-validated here.
+        if (metadata.IsHardPinned() || !metadata.IsLeaseExpired()) {
+            soft_pin_deferred_evals_[tenant_id.MakeScopedKey(key)] = candidate;
+            continue;
+        }
+        // A concurrent access re-activated the soft pin: it is indexed again
+        // and will be screened on its next expiry.
+        if (IsSoftPinActive(metadata, now)) {
+            continue;
+        }
+        // The object is no longer NoF-only; the normal eviction path owns it.
+        if (!metadata.IsNoFOnly() ||
+            !metadata.HasReplica(is_evictable_nof_replica)) {
+            continue;
+        }
+
+        // HA strong consistency: persist BEFORE erasing NoF replicas.
+        if (enable_oplog_ && ordered_oplog_writer_) {
+            auto remaining = BuildRemainingReplicaDescriptors(
+                metadata, is_evictable_nof_replica);
+            auto reservation = ReserveBatchOpLogSlot();
+            if (!reservation) {
+                LOG(WARNING)
+                    << "EvictSoftPinExpired: OpLog reservation failed for key="
+                    << key << ", err="
+                    << static_cast<int>(reservation.error())
+                    << ", re-queuing for retry";
+                soft_pin_deferred_evals_[tenant_id.MakeScopedKey(key)] =
+                    candidate;
+                continue;
+            }
+            std::vector<ReplicaID> removed_ids;
+            metadata.VisitReplicas(is_evictable_nof_replica,
+                                   [&removed_ids](Replica& replica) {
+                                       removed_ids.push_back(replica.id());
+                                       replica.mark_removed();
+                                   });
+            tl::expected<OpLogEntry, ErrorCode> persist_result;
+            if (remaining.empty()) {
+                persist_result = AppendReservedOpLogWithDurableFinalize(
+                    std::move(reservation.value()), OpType::REMOVE,
+                    tenant_id.value(), key, {},
+                    [this, removed_ids = std::move(removed_ids)](
+                        const OpLogEntry& durable_entry) {
+                        FinalizeRemovedReplicasAfterDurable(
+                            durable_entry, removed_ids, QuotaEraseMode::kFull);
+                    });
+            } else {
+                persist_result = AppendReservedOpLogWithDurableFinalize(
+                    std::move(reservation.value()), OpType::PUT_END,
+                    tenant_id.value(), key,
+                    SerializeMetadataForOpLogFromReplicaDescriptors(
+                        metadata, remaining),
+                    [this, removed_ids = std::move(removed_ids)](
+                        const OpLogEntry& durable_entry) {
+                        FinalizeRemovedReplicasAfterDurable(
+                            durable_entry, removed_ids, QuotaEraseMode::kFull);
+                    });
+            }
+            if (!persist_result) {
+                LOG(WARNING)
+                    << "EvictSoftPinExpired: OpLog persist failed for key="
+                    << key << ", err="
+                    << static_cast<int>(persist_result.error())
+                    << ", re-queuing for retry";
+                soft_pin_deferred_evals_[tenant_id.MakeScopedKey(key)] =
+                    candidate;
+            }
+            continue;
+        }
+
+        // Synchronous erase (non-HA path).
+        const size_t erased = metadata.EraseReplicas(is_evictable_nof_replica);
+        if (erased == 0) {
+            continue;
+        }
+        PublishKvRemovedAfterEvict(key, erased, "disk", metadata, tenant_id);
+        if (!metadata.IsValid()) {
+            accessor.Erase();
+        }
+    }
 }
 
 void MasterService::ClientMonitorFunc() {
