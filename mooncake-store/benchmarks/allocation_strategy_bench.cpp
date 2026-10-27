@@ -680,7 +680,7 @@ static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
     latencies.reserve(cfg.num_allocations);
 
     // Keep allocations alive until we compute final metrics.
-    std::vector<std::vector<Replica>> active_allocations;
+    std::vector<ReplicaVector> active_allocations;
     active_allocations.reserve(
         std::min(cfg.num_allocations, 1 << 20 /* 1M entries max */));
 
@@ -812,7 +812,7 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
         res.initial_capacity_gb;  // Will be updated after injection
     res.cluster_capacity_gb = res.initial_capacity_gb;
 
-    std::vector<std::vector<Replica>> active_allocations;
+    std::vector<ReplicaVector> active_allocations;
     // Reserve enough to avoid frequent reallocations.
     active_allocations.reserve(kMaxExpectedAllocs);
 
@@ -990,8 +990,8 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     return res;
 }
 
-static void evictRandomFraction(std::vector<std::vector<Replica>>& live,
-                                double ratio, std::mt19937& rng) {
+static void evictRandomFraction(std::vector<ReplicaVector>& live, double ratio,
+                                std::mt19937& rng) {
     if (live.empty()) return;
 
     size_t to_drop =
@@ -1010,9 +1010,8 @@ static void evictRandomFraction(std::vector<std::vector<Replica>>& live,
 static bool dsaAllocateWithEvict(
     const std::shared_ptr<AllocationStrategy>& strategy,
     AllocatorManager& manager, size_t size, int replica_num,
-    std::vector<std::vector<Replica>>& live, std::mt19937& rng,
-    int& evict_count, double evict_ratio,
-    std::vector<double>* pre_evict_util = nullptr) {
+    std::vector<ReplicaVector>& live, std::mt19937& rng, int& evict_count,
+    double evict_ratio, std::vector<double>* pre_evict_util = nullptr) {
     for (int attempt = 0; attempt <= kDsaMaxRetries; ++attempt) {
         auto result = strategy->Allocate(manager, size, replica_num);
         if (result.has_value()) {
@@ -1037,8 +1036,8 @@ static bool dsaAllocateWithEvict(
 static SizeClassAllocationResult sizeClassAllocateWithEvict(
     const std::shared_ptr<AllocationStrategy>& strategy,
     AllocatorManager& manager, size_t size, int replica_num,
-    std::vector<std::vector<Replica>>& live, std::mt19937& rng,
-    int& evict_count, double evict_ratio) {
+    std::vector<ReplicaVector>& live, std::mt19937& rng, int& evict_count,
+    double evict_ratio) {
     for (int attempt = 0; attempt <= kSizeClassMaxRetries; ++attempt) {
         auto result = strategy->Allocate(manager, size, replica_num);
         if (result.has_value()) {
@@ -1069,7 +1068,7 @@ static SizeClassPrefillStats prefillSizeClassChurn(
     const std::shared_ptr<AllocationStrategy>& strategy,
     AllocatorManager& manager, const BenchConfig& cfg,
     const std::vector<SizeClassSpec>& specs,
-    std::vector<std::vector<Replica>>& live_allocations, std::mt19937& rng) {
+    std::vector<ReplicaVector>& live_allocations, std::mt19937& rng) {
     SizeClassPrefillStats stats;
     if (cfg.prefill_pct <= 0 || specs.empty()) return stats;
     stats.requested_pct = cfg.prefill_pct;
@@ -1149,7 +1148,7 @@ static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
     util_ratios.reserve(measure_allocs);
 
     // Use one live set so eviction matches allocator_bench.
-    std::vector<std::vector<Replica>> live_allocations;
+    std::vector<ReplicaVector> live_allocations;
     live_allocations.reserve(std::min(total_allocs, 1 << 20));
 
     std::mt19937 rng(42);
@@ -1158,8 +1157,7 @@ static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
     if (warmup_allocs > 0) {
         int warmup_count = 0;
         int warmup_evict_throwaway = 0;
-        auto warmup_run = [&](size_t size,
-                              std::vector<std::vector<Replica>>& live) {
+        auto warmup_run = [&](size_t size, std::vector<ReplicaVector>& live) {
             (void)dsaAllocateWithEvict(strategy, manager, size, cfg.replica_num,
                                        live, rng, warmup_evict_throwaway,
                                        FLAGS_dsa_evict_ratio);
@@ -1184,8 +1182,7 @@ static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
     int total_count = 0;
     int evict_count = 0;
 
-    auto run_one = [&](size_t size,
-                       std::vector<std::vector<Replica>>& live) -> bool {
+    auto run_one = [&](size_t size, std::vector<ReplicaVector>& live) -> bool {
         auto t0 = std::chrono::high_resolution_clock::now();
         bool ok = dsaAllocateWithEvict(strategy, manager, size, cfg.replica_num,
                                        live, rng, evict_count,
@@ -1266,7 +1263,7 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
     std::vector<double> largest_free_mb_samples;
     largest_free_mb_samples.reserve(fragmentation_samples.capacity());
 
-    std::vector<std::vector<Replica>> live_allocations;
+    std::vector<ReplicaVector> live_allocations;
     live_allocations.reserve(std::min(cfg.num_allocations, 1 << 20));
 
     std::mt19937 rng(42);

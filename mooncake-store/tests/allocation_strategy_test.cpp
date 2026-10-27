@@ -289,7 +289,7 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentInsufficientSpace) {
     std::vector<std::string> preferred_segments = {"preferred"};
     // Store the results of the allocations to avoid deallocation of the buffers
     // before the test is done
-    std::vector<std::vector<Replica>> results;
+    std::vector<ReplicaVector> results;
     // Allocate multiple times to fill up the preferred allocator
     for (int i = 0; i < 4; ++i) {
         size_t large_slice = 15 * 1024 * 1024;  // 15MB
@@ -330,7 +330,7 @@ TEST_P(AllocationStrategyParameterizedTest, AllAllocatorsFull) {
     size_t large_slice = 15 * 1024 * 1024;  // 15MB
     // Store the results of the allocations to avoid deallocation of the buffers
     // before the test is done
-    std::vector<std::vector<Replica>> results;
+    std::vector<ReplicaVector> results;
     // Allocate 8 times to use 120MB total
     for (int i = 0; i < 8; ++i) {
         auto result =
@@ -623,7 +623,7 @@ TEST_P(AllocationStrategyParameterizedTest,
     std::array<size_t, kNumSegments> count = {0};
     size_t slice_length = 64 * 1024;      // 64KB per allocation
     const size_t kNumAllocations = 3000;  // Total 192MB allocated
-    std::vector<std::vector<Replica>> test_replicas;
+    std::vector<ReplicaVector> test_replicas;
 
     for (size_t i = 0; i < kNumAllocations; i++) {
         auto result = strategy_->Allocate(allocator_manager, slice_length);
@@ -707,7 +707,7 @@ TEST_F(AllocationStrategyTest, PerformanceComparison) {
 
     // Test Random strategy
     auto random_strategy = std::make_unique<RandomAllocationStrategy>();
-    std::vector<std::vector<Replica>> random_replicas;
+    std::vector<ReplicaVector> random_replicas;
     random_replicas.reserve(kNumAllocations);
 
     auto random_start = std::chrono::steady_clock::now();
@@ -726,7 +726,7 @@ TEST_F(AllocationStrategyTest, PerformanceComparison) {
 
     // Test FreeRatioFirst strategy
     auto frf_strategy = std::make_unique<FreeRatioFirstAllocationStrategy>();
-    std::vector<std::vector<Replica>> frf_replicas;
+    std::vector<ReplicaVector> frf_replicas;
     frf_replicas.reserve(kNumAllocations);
 
     auto frf_start = std::chrono::steady_clock::now();
@@ -768,7 +768,7 @@ TEST_F(AllocationStrategyTest, PerformanceTest) {
                                                           kSegmentSize, name));
     }
 
-    std::vector<std::vector<Replica>> replicas;
+    std::vector<ReplicaVector> replicas;
     replicas.reserve(kNumAllocations);
 
     // Do allocations.
@@ -967,7 +967,7 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstVsRandomStrategyPerformance) {
             (void)random_strategy->Allocate(state.allocators, kAllocSize);
         }
     }
-    std::vector<std::vector<Replica>> random_replicas;
+    std::vector<ReplicaVector> random_replicas;
     random_replicas.reserve(kBenchmarkRounds);
 
     auto t_rand_start = std::chrono::steady_clock::now();
@@ -988,7 +988,7 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstVsRandomStrategyPerformance) {
             (void)ssd_strategy.Allocate(placement, kAllocSize);
         }
     }
-    std::vector<std::vector<Replica>> ssd_replicas;
+    std::vector<ReplicaVector> ssd_replicas;
     ssd_replicas.reserve(kBenchmarkRounds);
 
     auto t_ssd_start = std::chrono::steady_clock::now();
@@ -1049,7 +1049,7 @@ TEST_P(AllocationStrategyParameterizedTest, HcaNameSelectsReceiverLocalNuma) {
 
 TEST_P(AllocationStrategyParameterizedTest, FullHcaTargetFallsBackToUnknown) {
     auto matching = CreateTestAllocator("receiver", 0);
-    std::vector<std::unique_ptr<AllocatedBuffer>> occupied;
+    std::vector<CoreUniquePtr<AllocatedBuffer>> occupied;
     while (auto buffer = matching->allocate(MiB)) {
         occupied.push_back(std::move(buffer));
     }

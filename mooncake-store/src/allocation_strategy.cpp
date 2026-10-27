@@ -5,7 +5,7 @@
 
 namespace mooncake {
 
-tl::expected<std::vector<Replica>, ErrorCode> AllocationStrategy::Allocate(
+tl::expected<ReplicaVector, ErrorCode> AllocationStrategy::Allocate(
     const ScopedAllocatorAccess& placement, const size_t slice_length,
     const size_t replica_num,
     const std::vector<std::string>& preferred_segments,
@@ -15,7 +15,7 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocationStrategy::Allocate(
                     preferred_segments, excluded_segments, replica_type);
 }
 
-tl::expected<std::vector<Replica>, ErrorCode>
+tl::expected<ReplicaVector, ErrorCode>
 SsdFreeRatioFirstAllocationStrategy::Allocate(
     const ScopedAllocatorAccess& placement, const size_t slice_length,
     const size_t replica_num,
@@ -41,7 +41,7 @@ SsdFreeRatioFirstAllocationStrategy::Allocate(
         });
 }
 
-tl::expected<std::vector<Replica>, ErrorCode>
+tl::expected<ReplicaVector, ErrorCode>
 SsdFreeRatioFirstAllocationStrategy::Allocate(
     const AllocatorManager& allocator_manager, const size_t slice_length,
     const size_t replica_num,

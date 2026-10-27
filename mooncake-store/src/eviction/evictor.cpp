@@ -108,14 +108,14 @@ class Evictor::Pass {
             return;
         }
         // Freed as this returns, after the lock is let go.
-        const std::vector<Replica> detached = EvictLocked(*hold, entry);
+        const ReplicaVector detached = EvictLocked(*hold, entry);
         hold.reset();
     }
 
     // Reclaims the object `hold` holds if it qualifies, tears it down if that
     // left it nothing valid, and returns the replicas it took.
-    std::vector<Replica> EvictLocked(const route::WriteGuard& hold,
-                                     const Entry* entry) {
+    ReplicaVector EvictLocked(const route::WriteGuard& hold,
+                              const Entry* entry) {
         // Filed ahead of its real rank: letting the lock go files it there,
         // where the walk meets it in its turn.
         if (entry != nullptr && !cursor_->StillAt(hold, *entry)) {

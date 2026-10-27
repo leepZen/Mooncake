@@ -245,7 +245,7 @@ class AllocationStrategy {
      * @param preferred_segments Preferred segments to allocate buffers from
      * @param excluded_segments Excluded segments that should not allocate
      * buffers from
-     * @return tl::expected<std::vector<Replica>, ErrorCode> containing
+     * @return tl::expected<ReplicaVector, ErrorCode> containing
      *         allocated replicas.
      *         - On success: vector of allocated replicas (may be fewer than
      *           requested due to resource constraints, but at least 1)
@@ -253,7 +253,7 @@ class AllocationStrategy {
      *           be allocated, ErrorCode::INVALID_PARAMS for invalid
      *           configuration
      */
-    virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+    virtual tl::expected<ReplicaVector, ErrorCode> Allocate(
         const AllocatorManager& allocator_manager, const size_t slice_length,
         const size_t replica_num = 1,
         const std::vector<std::string>& preferred_segments =
@@ -262,7 +262,7 @@ class AllocationStrategy {
             std::set<std::string>(),
         const ReplicaType replica_type = ReplicaType::MEMORY) = 0;
 
-    virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+    virtual tl::expected<ReplicaVector, ErrorCode> Allocate(
         const ScopedAllocatorAccess& placement, const size_t slice_length,
         const size_t replica_num = 1,
         const std::vector<std::string>& preferred_segments =
@@ -308,7 +308,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
    public:
     RandomAllocationStrategy() = default;
 
-    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+    tl::expected<ReplicaVector, ErrorCode> Allocate(
         const AllocatorManager& allocator_manager, const size_t slice_length,
         const size_t replica_num = 1,
         const std::vector<std::string>& preferred_segments =
@@ -327,7 +327,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
 
-        std::vector<Replica> replicas;
+        ReplicaVector replicas;
         replicas.reserve(replica_num);
 
         // Fast path: single segment case
@@ -428,7 +428,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
         return Replica{std::move(buffer), ReplicaStatus::PROCESSING};
     }
 
-    std::unique_ptr<AllocatedBuffer> allocateSingle(
+    CoreUniquePtr<AllocatedBuffer> allocateSingle(
         const AllocatorManager& allocator_manager, const std::string& name,
         const size_t slice_length) {
         const auto allocators = allocator_manager.getAllocators(name);
@@ -479,7 +479,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
 class RankedAllocationStrategy : public RandomAllocationStrategy {
    protected:
     template <typename ScoreFn>
-    tl::expected<std::vector<Replica>, ErrorCode> AllocateRanked(
+    tl::expected<ReplicaVector, ErrorCode> AllocateRanked(
         const AllocatorManager& allocator_manager, const size_t slice_length,
         const size_t replica_num,
         const std::vector<std::string>& preferred_segments,
@@ -494,7 +494,7 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
 
-        std::vector<Replica> replicas;
+        ReplicaVector replicas;
         replicas.reserve(replica_num);
         std::set<std::string> used_segments;
 
@@ -590,7 +590,7 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
 
 class FreeRatioFirstAllocationStrategy final : public RankedAllocationStrategy {
    public:
-    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+    tl::expected<ReplicaVector, ErrorCode> Allocate(
         const AllocatorManager& allocator_manager, const size_t slice_length,
         const size_t replica_num = 1,
         const std::vector<std::string>& preferred_segments =
@@ -641,7 +641,7 @@ class SsdFreeRatioFirstAllocationStrategy final
         const LocalSsdManager& local_ssd)
         : local_ssd_(local_ssd) {}
 
-    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+    tl::expected<ReplicaVector, ErrorCode> Allocate(
         const ScopedAllocatorAccess& placement, const size_t slice_length,
         const size_t replica_num = 1,
         const std::vector<std::string>& preferred_segments =
@@ -650,7 +650,7 @@ class SsdFreeRatioFirstAllocationStrategy final
             std::set<std::string>(),
         const ReplicaType replica_type = ReplicaType::MEMORY) override;
 
-    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+    tl::expected<ReplicaVector, ErrorCode> Allocate(
         const AllocatorManager& allocator_manager, const size_t slice_length,
         const size_t replica_num = 1,
         const std::vector<std::string>& preferred_segments =
@@ -666,7 +666,7 @@ class SsdFreeRatioFirstAllocationStrategy final
 class CxlAllocationStrategy : public AllocationStrategy {
    public:
     CxlAllocationStrategy() = default;
-    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+    tl::expected<ReplicaVector, ErrorCode> Allocate(
         const AllocatorManager& allocator_manager, const size_t slice_length,
         const size_t replica_num = 1,
         const std::vector<std::string>& preferred_segments =
@@ -693,10 +693,10 @@ class CxlAllocationStrategy : public AllocationStrategy {
         if (cxl_allocators == nullptr || cxl_allocators->size() == 0) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
-        std::vector<Replica> replicas;
+        ReplicaVector replicas;
         replicas.reserve(replica_num);
 
-        std::unique_ptr<AllocatedBuffer> buffer;
+        CoreUniquePtr<AllocatedBuffer> buffer;
         for (const auto& registration : *cxl_allocators) {
             if (registration->IsServing()) {
                 buffer = registration->Allocate(slice_length);

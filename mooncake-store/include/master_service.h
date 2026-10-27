@@ -1134,7 +1134,9 @@ class MasterService {
         ObjectMetadata metadata;
         route::ObjectState state;
     };
-    using ObjectMap = std::unordered_map<std::string, ObjectRecord>;
+    using ObjectMap = std::unordered_map<
+        CoreString, ObjectRecord, CoreStringHash, CoreStringEqual,
+        CoreHeapAllocator<std::pair<const CoreString, ObjectRecord>>>;
 
     struct TenantState {
         TenantQuotaHandle quota_account{nullptr};
@@ -1143,11 +1145,14 @@ class MasterService {
         bool Empty() const { return metadata.empty(); }
     };
 
+    using TenantMap = std::unordered_map<
+        CoreTenantId, TenantState, CoreTenantIdHash, CoreTenantIdEqual,
+        CoreHeapAllocator<std::pair<const CoreTenantId, TenantState>>>;
+
     // Sharded metadata maps and their mutexes
     struct MetadataShard {
         mutable SharedMutex mutex;
-        std::unordered_map<TenantId, TenantState, TenantIdHash> tenants
-            GUARDED_BY(mutex);
+        TenantMap tenants GUARDED_BY(mutex);
         // Count of objects that have at least one completed LOCAL_DISK replica.
         // Used to compute eviction_base = metadata.size() - disk_object_count,
         // excluding disk-only objects from the eviction denominator.
@@ -1226,11 +1231,10 @@ class MasterService {
     static void SyncCacheTotalAccounting(ObjectMetadata& metadata);
     void RebuildCacheTotalAccounting();
     static void AccountCacheTotalRemoval(ObjectMetadata& metadata);
-    std::vector<Replica> PopReplicasWithCacheTotalAccounting(
+    ReplicaVector PopReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn);
-    std::vector<Replica> PopReplicasWithCacheTotalAccounting(
-        ObjectMetadata& metadata);
+    ReplicaVector PopReplicasWithCacheTotalAccounting(ObjectMetadata& metadata);
     size_t EraseReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn,
@@ -1561,7 +1565,7 @@ class MasterService {
                           const ReplicateConfig& config,
                           const std::string& writer_host_id,
                           bool* dfs_allocation_failed = nullptr)
-        -> tl::expected<std::vector<Replica>, ErrorCode>;
+        -> tl::expected<ReplicaVector, ErrorCode>;
 
     // Publishes a new object under the key `accessor` holds, which must hold
     // none.
@@ -1570,8 +1574,7 @@ class MasterService {
                         const std::string& group_id,
                         const std::chrono::system_clock::time_point& now,
                         const ResolvedSoftPinRequest& soft_pin_request,
-                        std::vector<Replica>&& replicas,
-                        uint64_t pending_quota_charge,
+                        ReplicaVector&& replicas, uint64_t pending_quota_charge,
                         std::optional<std::chrono::system_clock::time_point>
                             committed_soft_pin_timeout = std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
@@ -2043,8 +2046,7 @@ class MasterService {
         const MasterService* service_;
         const size_t shard_idx_;
         MetadataShardAccessorRO shard_guard_;
-        std::unordered_map<TenantId, TenantState, TenantIdHash>::const_iterator
-            tenant_it_;
+        TenantMap::const_iterator tenant_it_;
         const TenantState* tenant_state_;
         ObjectMetadataConstIterator it_;
     };
@@ -2152,7 +2154,7 @@ class MasterService {
             using Metadata = Access<ObjectMetadata>;
             using State = Access<route::ObjectState>;
 
-            const std::string& key() const { return it_->first; }
+            const CoreString& key() const { return it_->first; }
             route::Generation generation() const {
                 return it_->second.generation;
             }
@@ -2432,7 +2434,7 @@ class MasterService {
        public:
         DiscardedReplicas() = delete;
 
-        DiscardedReplicas(std::vector<Replica>&& replicas,
+        DiscardedReplicas(ReplicaVector&& replicas,
                           std::chrono::system_clock::time_point ttl)
             : replicas_(std::move(replicas)), ttl_(ttl), mem_size_(0) {
             for (auto& replica : replicas_) {
@@ -2456,7 +2458,7 @@ class MasterService {
         }
 
        private:
-        std::vector<Replica> replicas_;
+        ReplicaVector replicas_;
         std::chrono::system_clock::time_point ttl_;
         uint64_t mem_size_;
     };

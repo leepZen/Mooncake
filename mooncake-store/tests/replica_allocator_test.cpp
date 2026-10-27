@@ -26,7 +26,7 @@ class TestAllocationCandidate final : public AllocationCandidate {
           is_cxl_(is_cxl),
           cxl_binding_(std::move(cxl_binding)) {}
 
-    std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const override {
+    CoreUniquePtr<AllocatedBuffer> Allocate(size_t size) const override {
         auto buffer = allocator().allocate(size);
         if (buffer && is_cxl_) {
             buffer->change_to_cxl(cxl_binding_);
@@ -92,7 +92,7 @@ ReplicaAllocationRequest Request(size_t replica_count = 1) {
     return request;
 }
 
-std::set<std::string> Endpoints(const std::vector<Replica>& replicas) {
+std::set<std::string> Endpoints(const ReplicaVector& replicas) {
     std::set<std::string> result;
     for (const auto& replica : replicas) {
         result.insert(ReplicaEndpoint(replica));

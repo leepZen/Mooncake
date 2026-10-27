@@ -23,7 +23,7 @@ class TestBufferAllocator final
           base_(base),
           allow_allocation_(allow_allocation_promise_.get_future().share()) {}
 
-    std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
+    CoreUniquePtr<AllocatedBuffer> allocate(size_t size) override {
         allocation_calls_.fetch_add(1, std::memory_order_relaxed);
         if (block_next_.exchange(false, std::memory_order_acq_rel)) {
             allocation_started_promise_.set_value();
@@ -40,7 +40,7 @@ class TestBufferAllocator final
                 const uintptr_t address =
                     base_ +
                     next_offset_.fetch_add(size, std::memory_order_relaxed);
-                return std::make_unique<AllocatedBuffer>(
+                return MakeCoreUnique<AllocatedBuffer>(
                     shared_from_this(), reinterpret_cast<void*>(address), size);
             }
         }

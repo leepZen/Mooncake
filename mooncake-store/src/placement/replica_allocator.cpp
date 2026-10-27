@@ -70,7 +70,7 @@ PlacementScratch& GetPlacementScratch() {
     return scratch;
 }
 
-std::unique_ptr<AllocatedBuffer> TryAllocateFromEntry(
+CoreUniquePtr<AllocatedBuffer> TryAllocateFromEntry(
     const PlacementIndex::Entry* entry, size_t size) {
     if (!entry || entry->candidates.empty()) {
         return nullptr;
@@ -158,7 +158,7 @@ void ResolveEntries(const PlacementIndex& index,
     }
 }
 
-tl::expected<std::vector<Replica>, ErrorCode> AllocatePreferredOnly(
+tl::expected<ReplicaVector, ErrorCode> AllocatePreferredOnly(
     const PlacementIndex& index, const ReplicaAllocationRequest& request,
     AllocationCandidateKind required_kind, PlacementScratch& scratch) {
     const auto& replicas = request.replicas;
@@ -184,7 +184,7 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocatePreferredOnly(
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 
-    std::vector<Replica> result;
+    ReplicaVector result;
     result.reserve(1);
     result.emplace_back(std::move(buffer), ReplicaStatus::PROCESSING,
                         replicas.type);
@@ -193,7 +193,7 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocatePreferredOnly(
 
 bool TryAddReplica(const PlacementIndex::Entry* entry,
                    const ReplicaRequirements& requirements,
-                   PlacementScratch& scratch, std::vector<Replica>& result) {
+                   PlacementScratch& scratch, ReplicaVector& result) {
     auto buffer = TryAllocateFromEntry(entry, requirements.size);
     if (!buffer) {
         return false;
@@ -206,7 +206,7 @@ bool TryAddReplica(const PlacementIndex::Entry* entry,
 
 void AllocatePreferredEntries(const ReplicaRequirements& requirements,
                               PlacementScratch& scratch,
-                              std::vector<Replica>& result) {
+                              ReplicaVector& result) {
     for (const auto* entry : scratch.preferred) {
         if (scratch.excluded.contains(entry) || scratch.HasUsed(entry)) {
             continue;
@@ -222,7 +222,7 @@ template <typename Ranker>
 void AllocateRankedEntries(
     std::span<const PlacementIndex::Entry* const> active_entries,
     const ReplicaRequirements& requirements, const Ranker& ranker,
-    PlacementScratch& scratch, std::vector<Replica>& result) {
+    PlacementScratch& scratch, ReplicaVector& result) {
     const size_t remaining = requirements.count - result.size();
     const size_t sample_count =
         std::min(active_entries.size(), kCandidateMultiplier * remaining);
@@ -251,7 +251,7 @@ void AllocateRankedEntries(
 void AllocateFallbackEntries(
     std::span<const PlacementIndex::Entry* const> active_entries,
     const ReplicaRequirements& requirements, PlacementScratch& scratch,
-    std::vector<Replica>& result) {
+    ReplicaVector& result) {
     size_t index_offset = randomIndex(active_entries.size());
     const size_t max_retry = std::min(kMaxRetryLimit, active_entries.size());
     for (size_t attempt = 0;
@@ -267,7 +267,7 @@ void AllocateFallbackEntries(
 }
 
 template <typename Ranker>
-tl::expected<std::vector<Replica>, ErrorCode> AllocateWithRanker(
+tl::expected<ReplicaVector, ErrorCode> AllocateWithRanker(
     ScopedPlacementReadAccess& placement,
     const ReplicaAllocationRequest& request,
     AllocationCandidateKind target_kind, PlacementScratch& scratch,
@@ -282,7 +282,7 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocateWithRanker(
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 
-    std::vector<Replica> result;
+    ReplicaVector result;
     result.reserve(std::min(requirements.count, active_entries.size()));
 
     if (active_entries.size() == 1) {
@@ -341,7 +341,7 @@ void UpdateDiagnostics(const PlacementIndex& index,
 }
 
 template <typename Ranker>
-tl::expected<std::vector<Replica>, ErrorCode> AllocateUsingRanker(
+tl::expected<ReplicaVector, ErrorCode> AllocateUsingRanker(
     ScopedPlacementReadAccess& placement,
     const ReplicaAllocationRequest& request, PlacementDiagnostics* diagnostics,
     const Ranker& ranker, bool use_host_affinity) {
@@ -355,7 +355,7 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocateUsingRanker(
                               use_host_affinity);
 }
 
-tl::expected<std::vector<Replica>, ErrorCode> AllocateUsingPreferences(
+tl::expected<ReplicaVector, ErrorCode> AllocateUsingPreferences(
     ScopedPlacementReadAccess& placement,
     const ReplicaAllocationRequest& request, PlacementDiagnostics* diagnostics,
     AllocationCandidateKind required_kind) {
@@ -400,10 +400,10 @@ std::optional<double> LocalSSDMetricsView::GetFreeRatio(
 }
 
 template <ReplicaPlacementPolicy Policy>
-tl::expected<std::vector<Replica>, ErrorCode>
-ReplicaAllocator<Policy>::Allocate(ScopedPlacementReadAccess& placement,
-                                   const ReplicaAllocationRequest& request,
-                                   PlacementDiagnostics* diagnostics) const {
+tl::expected<ReplicaVector, ErrorCode> ReplicaAllocator<Policy>::Allocate(
+    ScopedPlacementReadAccess& placement,
+    const ReplicaAllocationRequest& request,
+    PlacementDiagnostics* diagnostics) const {
     if constexpr (std::same_as<Policy, PreferredOnlyPlacementPolicy>) {
         return AllocateUsingPreferences(placement, request, diagnostics,
                                         policy_.required_kind);

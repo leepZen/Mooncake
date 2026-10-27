@@ -47,7 +47,7 @@ class LeaseEvictionIndexTest : public ::testing::Test {
                    const std::string& group_id,
                    ReplicaStatus status = ReplicaStatus::COMPLETE,
                    bool hard_pinned = false) {
-        std::vector<Replica> replicas;
+        ReplicaVector replicas;
         replicas.emplace_back(allocator_->allocate(128), status);
         (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
                             std::move(replicas), std::nullopt, hard_pinned,

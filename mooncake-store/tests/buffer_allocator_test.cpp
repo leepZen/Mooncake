@@ -124,7 +124,7 @@ TEST_F(BufferAllocatorTest, AllocateMultiple) {
 
         // Allocate multiple memory blocks
         size_t alloc_size = 1024 * 1024;  // 1MB per block
-        std::vector<std::unique_ptr<AllocatedBuffer>> handles;
+        std::vector<CoreUniquePtr<AllocatedBuffer>> handles;
 
         // Attempt to allocate 8 blocks (should succeed as total size is less
         // than buffer size)

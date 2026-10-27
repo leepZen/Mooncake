@@ -27,11 +27,11 @@ class SegmentPool::WriteAccess::RegionMountTxn final {
     // before the staged resource is published.
     [[nodiscard]] ErrorCode Commit(SegmentPool::WriteAccess& access) noexcept;
 
-    const std::vector<std::unique_ptr<AllocatedBuffer>>& imported_buffers()
+    const std::vector<CoreUniquePtr<AllocatedBuffer>>& imported_buffers()
         const noexcept {
         return resource_.imported_buffers();
     }
-    std::vector<std::unique_ptr<AllocatedBuffer>> TakeImportedBuffers() {
+    std::vector<CoreUniquePtr<AllocatedBuffer>> TakeImportedBuffers() {
         return resource_.TakeImportedBuffers();
     }
     uint64_t imported_requested_bytes() const noexcept {

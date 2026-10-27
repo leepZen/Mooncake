@@ -21,7 +21,7 @@ class NativeAllocationCandidate final : public AllocationCandidate {
         std::shared_ptr<BufferAllocatorBase> allocator)
         : AllocationCandidate(std::move(allocator)) {}
 
-    std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const override {
+    CoreUniquePtr<AllocatedBuffer> Allocate(size_t size) const override {
         return allocator().allocate(size);
     }
 
@@ -37,7 +37,7 @@ class CxlAllocationCandidate final : public AllocationCandidate {
         : AllocationCandidate(std::move(allocator)),
           cxl_binding_name_(std::move(binding_name)) {}
 
-    std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const override {
+    CoreUniquePtr<AllocatedBuffer> Allocate(size_t size) const override {
         auto buffer = allocator().allocate(size);
         if (buffer) {
             buffer->change_to_cxl(cxl_binding_name_);
@@ -107,7 +107,7 @@ RegionResource::RegionResource(
 struct PreparedRegionResource::State {
     State(RegionDriver& resource_driver, const UUID& id,
           std::unique_ptr<RegionResource> staged_resource,
-          std::vector<std::unique_ptr<AllocatedBuffer>> buffers)
+          std::vector<CoreUniquePtr<AllocatedBuffer>> buffers)
         : driver(resource_driver), imported_buffers(std::move(buffers)) {
         ResourceMap staged;
         auto inserted = staged.emplace(id, std::move(staged_resource));
@@ -116,14 +116,14 @@ struct PreparedRegionResource::State {
 
     RegionDriver& driver;
     ResourceMap::node_type resource;
-    std::vector<std::unique_ptr<AllocatedBuffer>> imported_buffers;
+    std::vector<CoreUniquePtr<AllocatedBuffer>> imported_buffers;
     std::unique_ptr<RegionResource> replaced_resource;
 };
 
 PreparedRegionResource::PreparedRegionResource(
     StageKey, RegionDriver& driver, const UUID& id,
     std::unique_ptr<RegionResource> resource,
-    std::vector<std::unique_ptr<AllocatedBuffer>> imported_buffers)
+    std::vector<CoreUniquePtr<AllocatedBuffer>> imported_buffers)
     : state_(std::make_unique<State>(driver, id, std::move(resource),
                                      std::move(imported_buffers))) {}
 
@@ -137,16 +137,16 @@ RegionResource& PreparedRegionResource::resource() const noexcept {
     return *state_->resource.mapped();
 }
 
-const std::vector<std::unique_ptr<AllocatedBuffer>>&
+const std::vector<CoreUniquePtr<AllocatedBuffer>>&
 PreparedRegionResource::imported_buffers() const noexcept {
-    static const std::vector<std::unique_ptr<AllocatedBuffer>> empty;
+    static const std::vector<CoreUniquePtr<AllocatedBuffer>> empty;
     return state_ ? state_->imported_buffers : empty;
 }
 
-std::vector<std::unique_ptr<AllocatedBuffer>>
+std::vector<CoreUniquePtr<AllocatedBuffer>>
 PreparedRegionResource::TakeImportedBuffers() {
     return state_ ? std::move(state_->imported_buffers)
-                  : std::vector<std::unique_ptr<AllocatedBuffer>>{};
+                  : std::vector<CoreUniquePtr<AllocatedBuffer>>{};
 }
 
 void PreparedRegionResource::Commit() noexcept {
@@ -200,7 +200,7 @@ bool RegionDriver::Erase(const UUID& id) { return resources_.erase(id) != 0; }
 
 PreparedRegionResource RegionDriver::Stage(
     const UUID& id, std::unique_ptr<RegionResource> resource,
-    std::vector<std::unique_ptr<AllocatedBuffer>> imported_buffers) {
+    std::vector<CoreUniquePtr<AllocatedBuffer>> imported_buffers) {
     return PreparedRegionResource(StageKey{}, *this, id, std::move(resource),
                                   std::move(imported_buffers));
 }

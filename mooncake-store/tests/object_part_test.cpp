@@ -25,6 +25,7 @@
 #include "master_service/master_service_test_peer.h"
 #include "metadata_store.h"
 #include "replica.h"
+#include "test_buffer_allocator.h"
 
 namespace mooncake {
 namespace {
@@ -41,9 +42,8 @@ Replica MakeDiskReplica(ReplicaStatus status) {
     return Replica(std::string("file://part-test"), kObjectLength, status);
 }
 
-std::vector<Replica> MakeDiskReplicas(
-    const std::vector<ReplicaStatus>& statuses) {
-    std::vector<Replica> replicas;
+ReplicaVector MakeDiskReplicas(const std::vector<ReplicaStatus>& statuses) {
+    ReplicaVector replicas;
     replicas.reserve(statuses.size());
     for (const auto status : statuses) {
         replicas.push_back(MakeDiskReplica(status));
@@ -52,7 +52,7 @@ std::vector<Replica> MakeDiskReplicas(
 }
 
 std::unique_ptr<ObjectMetadata> MakeEnvelope(size_t length,
-                                             std::vector<Replica>&& replicas) {
+                                             ReplicaVector&& replicas) {
     return std::make_unique<ObjectMetadata>(
         UUID{1, 2}, kWriteTime, length, std::move(replicas), std::nullopt,
         false, ObjectDataType::UNKNOWN, std::string(kGroupId), TenantId(),
@@ -76,7 +76,7 @@ class OplogPayloadTest : public ::testing::Test {
 };
 
 TEST(ObjectPartTest, HoldsItsLengthAndChecksum) {
-    ObjectPart part(kObjectLength, std::vector<Replica>{});
+    ObjectPart part(kObjectLength, ReplicaVector{});
 
     EXPECT_EQ(part.length(), kObjectLength);
     EXPECT_FALSE(part.checksum().has_value());
@@ -87,8 +87,57 @@ TEST(ObjectPartTest, HoldsItsLengthAndChecksum) {
     EXPECT_EQ(*part.checksum(), kChecksum);
 }
 
+TEST(ObjectPartTest, NoFMetadataIsHeldUntilDeferredReplicasAreReleased) {
+    const auto before = GetMasterCoreHeapAccount().Load();
+    auto allocator = std::make_shared<test::TestBufferAllocator>(
+        "nof-meta-test", "nof-meta-endpoint", 16 * 1024 * 1024);
+    EXPECT_EQ(GetMasterCoreHeapAccount().Load(), before);
+    ReplicaVector deferred;
+    uint64_t held_bytes = 0;
+    {
+        auto small = allocator->allocate(4096);
+        ASSERT_NE(small, nullptr);
+        const auto one_buffer = GetMasterCoreHeapAccount().Load() - before;
+        auto large = allocator->allocate(1024 * 1024);
+        ASSERT_NE(large, nullptr);
+        // A larger remote value does not allocate a larger metadata object.
+        EXPECT_EQ(GetMasterCoreHeapAccount().Load() - before, one_buffer * 2);
+        small.reset();
+
+        ReplicaVector replicas;
+        replicas.emplace_back(std::move(large), ReplicaStatus::COMPLETE,
+                              ReplicaType::NOF_SSD);
+        ObjectPart part(1024 * 1024, std::move(replicas));
+        held_bytes = GetMasterCoreHeapAccount().Load();
+        deferred = part.PopReplicas();
+        EXPECT_EQ(GetMasterCoreHeapAccount().Load(), held_bytes);
+    }
+    EXPECT_EQ(GetMasterCoreHeapAccount().Load(), held_bytes);
+    deferred.clear();
+    EXPECT_GT(GetMasterCoreHeapAccount().Load(), before);  // Reserved array.
+    ReplicaVector{}.swap(deferred);
+    EXPECT_EQ(GetMasterCoreHeapAccount().Load(), before);
+}
+
+TEST(EnvelopePartTest, PendingAndDynamicStateDoNotCountAsCoreHeap) {
+    const auto before = GetMasterCoreHeapAccount().Load();
+    {
+        auto metadata = MakeEnvelope(kObjectLength, {});
+        const auto core = GetMasterCoreHeapAccount().Load();
+        metadata->BeginSessionTag(std::string(512, 's'), {1, 2, 3});
+        metadata->BeginSoftPinAction({}, {1, 2, 3});
+        metadata->MarkDynamicReplica(
+            1, {kWriteTime, std::string(512, 'a'), std::string(512, 'b'),
+                std::string(512, 'd'), false});
+        EXPECT_EQ(GetMasterCoreHeapAccount().Load(), core);
+        metadata->CommitSessionTag(1);
+        EXPECT_GE(GetMasterCoreHeapAccount().Load() - core, 513u);
+    }
+    EXPECT_EQ(GetMasterCoreHeapAccount().Load(), before);
+}
+
 TEST(ObjectPartTest, AppendsReplicasAndReadsThemThroughTheSpan) {
-    ObjectPart part(kObjectLength, std::vector<Replica>{});
+    ObjectPart part(kObjectLength, ReplicaVector{});
     auto replicas =
         MakeDiskReplicas({ReplicaStatus::COMPLETE, ReplicaStatus::PROCESSING});
     const ReplicaID processing_id = replicas.back().id();
@@ -111,7 +160,7 @@ TEST(ObjectPartTest, AppendsReplicasAndReadsThemThroughTheSpan) {
 }
 
 TEST(ObjectPartTest, TheSpanReachesTheStoredReplicas) {
-    ObjectPart part(kObjectLength, std::vector<Replica>{});
+    ObjectPart part(kObjectLength, ReplicaVector{});
     part.AddReplicas(MakeDiskReplicas({ReplicaStatus::PROCESSING}));
 
     const auto processing =
@@ -123,7 +172,7 @@ TEST(ObjectPartTest, TheSpanReachesTheStoredReplicas) {
 }
 
 TEST(ObjectPartTest, PopsOnlyTheMatchingReplicas) {
-    ObjectPart part(kObjectLength, std::vector<Replica>{});
+    ObjectPart part(kObjectLength, ReplicaVector{});
     part.AddReplicas(
         MakeDiskReplicas({ReplicaStatus::COMPLETE, ReplicaStatus::PROCESSING,
                           ReplicaStatus::COMPLETE}));
@@ -223,6 +272,44 @@ TEST_F(OplogPayloadTest, TheOplogPayloadCarriesTheEnvelopeFields) {
     EXPECT_EQ(payload.data_type.value_or(ObjectDataType::UNKNOWN),
               ObjectDataType::UNKNOWN);
     EXPECT_FALSE(payload.hard_pinned.value_or(true));
+}
+
+TEST_F(OplogPayloadTest,
+       MasterCoreHeapReturnsToBaselineAfterServiceDestruction) {
+    const auto before = GetMasterCoreHeapAccount().Load();
+    {
+        MasterServiceConfig config;
+        config.default_kv_lease_ttl = 0;
+        MasterService service(config);
+        EXPECT_EQ(GetMasterCoreHeapAccount().Load(), before);
+
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = "core-heap-segment";
+        segment.te_endpoint = segment.name;
+        segment.base = 0x300000000;
+        segment.size = 16 * 1024 * 1024;
+        const UUID client = generate_uuid();
+        ASSERT_TRUE(service.MountSegment(segment, client).has_value());
+        // Offset allocator nodes and segment registrations are not core KV.
+        EXPECT_EQ(GetMasterCoreHeapAccount().Load(), before);
+
+        const std::string key(512, 'k');
+        ReplicateConfig replicas;
+        replicas.replica_num = 1;
+        ASSERT_TRUE(
+            service.PutStart(client, key, TenantId::Default(), 4096, replicas)
+                .has_value());
+        ASSERT_TRUE(
+            service
+                .PutEnd(client, key, TenantId::Default(), ReplicaType::MEMORY)
+                .has_value());
+        const auto published = GetMasterCoreHeapAccount().Load();
+        EXPECT_GE(published - before, 2 * (key.size() + 1));
+        ASSERT_TRUE(service.Remove(key, TenantId::Default()).has_value());
+        EXPECT_LT(GetMasterCoreHeapAccount().Load(), published);
+    }
+    EXPECT_EQ(GetMasterCoreHeapAccount().Load(), before);
 }
 
 }  // namespace mooncake

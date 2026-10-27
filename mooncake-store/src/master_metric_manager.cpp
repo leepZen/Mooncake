@@ -8,6 +8,7 @@
 #include <cmath>
 
 #include "common/byte_size.h"
+#include "metadata/kv_core_heap_accounting.h"
 #include "segment.h"
 #include "version.h"
 
@@ -2029,6 +2030,12 @@ std::string MasterMetricManager::serialize_metrics() {
     allocator_metric_.Refresh();
     serialize_metric(allocator_metric_);
 
+    ss << "# HELP kv_core_heap_bytes Outstanding requested heap bytes for KV "
+          "core metadata, excluding storage payloads and auxiliary indexes\n"
+          "# TYPE kv_core_heap_bytes gauge\n"
+          "kv_core_heap_bytes "
+       << GetMasterCoreHeapAccount().Load() << '\n';
+
     // Serialize Gauges
     serialize_metric(mem_allocated_size_);
     serialize_metric(mem_total_capacity_);
@@ -2636,6 +2643,7 @@ std::string MasterMetricManager::get_summary_string(
         ss << " files=" << dfs_files;
     }
     ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
+    ss << " | kv_core_heap_bytes=" << GetMasterCoreHeapAccount().Load();
     ss << " | Clients: " << active_clients;
 
     // Request summary - rate per second of the last window

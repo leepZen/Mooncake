@@ -235,8 +235,7 @@ CachelibBufferAllocator::~CachelibBufferAllocator() {
     }
 };
 
-std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
-    size_t size) {
+CoreUniquePtr<AllocatedBuffer> CachelibBufferAllocator::allocate(size_t size) {
     void* buffer = nullptr;
     try {
         // Allocate memory using CacheLib.
@@ -265,7 +264,7 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
         MasterMetricManager::instance().inc_allocated_nof_size(segment_name_,
                                                                size);
     }
-    return std::make_unique<AllocatedBuffer>(shared_from_this(), buffer, size);
+    return MakeCoreUnique<AllocatedBuffer>(shared_from_this(), buffer, size);
 }
 
 void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
@@ -294,7 +293,7 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
     }
 }
 
-std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::adoptImportedBuffer(
+CoreUniquePtr<AllocatedBuffer> CachelibBufferAllocator::adoptImportedBuffer(
     const LiveAllocation& allocation) {
     RecordAllocation(allocation.requested_size);
     if (replica_type_ == ReplicaType::MEMORY) {
@@ -304,7 +303,7 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::adoptImportedBuffer(
         MasterMetricManager::instance().inc_allocated_nof_size(
             segment_name_, allocation.requested_size);
     }
-    return std::make_unique<AllocatedBuffer>(
+    return MakeCoreUnique<AllocatedBuffer>(
         shared_from_this(),
         reinterpret_cast<void*>(base_ + allocation.offset_from_base),
         allocation.requested_size);
@@ -342,7 +341,7 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
         return std::nullopt;
     }
 
-    std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+    std::vector<CoreUniquePtr<AllocatedBuffer>> buffers;
     buffers.reserve(allocations.size());
     for (const auto& allocation : allocations) {
         buffers.push_back(allocator->adoptImportedBuffer(allocation));
@@ -405,13 +404,13 @@ OffsetBufferAllocator::~OffsetBufferAllocator() {
     }
 };
 
-std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
+CoreUniquePtr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
     if (!offset_allocator_) {
         LOG(ERROR) << "allocator_status=not_initialized";
         return nullptr;
     }
 
-    std::unique_ptr<AllocatedBuffer> allocated_buffer = nullptr;
+    CoreUniquePtr<AllocatedBuffer> allocated_buffer = nullptr;
     try {
         // Allocate memory using OffsetAllocator
         auto allocation_handle = offset_allocator_->allocate(size);
@@ -427,7 +426,7 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
 
         // Create a custom AllocatedBuffer that manages the
         // OffsetAllocationHandle
-        allocated_buffer = std::make_unique<AllocatedBuffer>(
+        allocated_buffer = MakeCoreUnique<AllocatedBuffer>(
             shared_from_this(), buffer_ptr, size, std::move(allocation_handle));
         VLOG(1) << "allocation_succeeded size=" << size
                 << " segment=" << segment_name_ << " address=" << buffer_ptr;
@@ -511,8 +510,8 @@ std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
                allocations[rhs].offset_from_base;
     });
 
-    std::vector<std::unique_ptr<AllocatedBuffer>> buffers(allocations.size());
-    std::vector<std::unique_ptr<AllocatedBuffer>> gaps;
+    std::vector<CoreUniquePtr<AllocatedBuffer>> buffers(allocations.size());
+    std::vector<CoreUniquePtr<AllocatedBuffer>> gaps;
     size_t cursor = base;
 
     auto fill_gap = [&](size_t gap) {

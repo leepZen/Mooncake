@@ -876,7 +876,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             std::shared_ptr<BufferAllocatorBase> restored_allocator;
             std::vector<Replica*> replicas;
             std::vector<AllocatedBuffer::Descriptor> descriptors;
-            std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+            std::vector<CoreUniquePtr<AllocatedBuffer>> buffers;
             uint64_t imported_size{0};
         };
         std::vector<SegmentRestore> restores;
@@ -1440,7 +1440,7 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
             if (!rebuild_result) {
                 throw std::runtime_error(
                     "failed to rebuild object tenant quota ledger for " +
-                    tenant_id.value() + "/" + object.key());
+                    tenant_id.value() + "/" + std::string(object.key()));
             }
         }
     });
@@ -1458,7 +1458,7 @@ std::shared_ptr<Lease> MasterService::RegisterGroupMember(
     const auto scoped_group = tenant_id.MakeScopedKey(group_id);
     auto [it, inserted] = shard->groups.try_emplace(scoped_group);
     if (inserted) {
-        it->second.lease = std::make_shared<Lease>();
+        it->second.lease = MakeCoreShared<Lease>();
     }
     it->second.member_keys.insert(key);
     return it->second.lease;
@@ -1650,7 +1650,7 @@ void MasterService::RebuildCacheTotalAccounting() {
     }
 }
 
-std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
+ReplicaVector MasterService::PopReplicasWithCacheTotalAccounting(
     ObjectMetadata& metadata,
     const std::function<bool(const Replica&)>& pred_fn) {
     auto replicas = metadata.PopReplicas(pred_fn);
@@ -1658,7 +1658,7 @@ std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
     return replicas;
 }
 
-std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
+ReplicaVector MasterService::PopReplicasWithCacheTotalAccounting(
     ObjectMetadata& metadata) {
     auto replicas = metadata.PopReplicas();
     SyncCacheTotalAccounting(metadata);
@@ -3070,8 +3070,9 @@ auto MasterService::GetAllKeys(const TenantId& tenant_id)
         if (!HasReadableReplica(metadata)) {
             continue;
         }
-        all_keys.push_back(metadata.user_key.empty() ? object.key()
-                                                     : metadata.user_key);
+        all_keys.emplace_back(metadata.user_key.empty()
+                                  ? std::string_view(object.key())
+                                  : std::string_view(metadata.user_key));
     }
     return all_keys;
 }
@@ -3197,7 +3198,7 @@ struct MasterService::PreparedObject {
     const StandbyObjectEntry* entry;
     TenantId tenant_id;
     std::string user_key;
-    std::vector<Replica> replicas;
+    ReplicaVector replicas;
 };
 
 // Shared state for the tolerant legacy-snapshot restore (#3760): one bad
@@ -3420,7 +3421,7 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
         const auto& entry = *accepted_entry.entry;
         const auto& standby_meta = entry.metadata;
         const auto discarded_it = ctx.discarded_replicas.find(owner);
-        std::vector<Replica> replicas;
+        ReplicaVector replicas;
         replicas.reserve(standby_meta.replicas.size());
         bool construction_ok = true;
         // Per-object bytes join the segment totals only once the whole
@@ -3457,7 +3458,7 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                 }
 
                 replicas.push_back(Replica(
-                    desc.id, std::make_unique<AllocatedBuffer>(alloc, buffer),
+                    desc.id, MakeCoreUnique<AllocatedBuffer>(alloc, buffer),
                     desc.status));
             } else if (desc.is_nof_replica()) {
                 const auto& buffer =
@@ -3474,7 +3475,7 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                         buffer.transport_endpoint_, buffer.transport_endpoint_);
                 }
                 replicas.push_back(Replica(
-                    desc.id, std::make_unique<AllocatedBuffer>(alloc, buffer),
+                    desc.id, MakeCoreUnique<AllocatedBuffer>(alloc, buffer),
                     desc.status, ReplicaType::NOF_SSD));
             } else if (desc.is_disk_replica()) {
                 const auto& disk_desc = desc.get_disk_descriptor();
@@ -3870,7 +3871,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                 return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }
             const auto& standby_meta = entry.metadata;
-            std::vector<Replica> replicas;
+            ReplicaVector replicas;
             replicas.reserve(standby_meta.replicas.size());
             bool dropped_stale_replica = false;
 
@@ -3952,7 +3953,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                     auto alloc =
                         restored_allocators.at(buffer.transport_endpoint_);
                     auto restored_buffer =
-                        std::make_unique<AllocatedBuffer>(alloc, buffer);
+                        MakeCoreUnique<AllocatedBuffer>(alloc, buffer);
                     replicas.push_back(Replica(
                         desc.id, std::move(restored_buffer), desc.status));
                 } else if (desc.is_nof_replica()) {
@@ -3998,7 +3999,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                             buffer.transport_endpoint_);
                     }
                     auto restored_buffer =
-                        std::make_unique<AllocatedBuffer>(alloc, buffer);
+                        MakeCoreUnique<AllocatedBuffer>(alloc, buffer);
                     replicas.push_back(
                         Replica(desc.id, std::move(restored_buffer),
                                 desc.status, ReplicaType::NOF_SSD));
@@ -4241,7 +4242,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         nof_segment.base = info.base;
         nof_segment.size = info.capacity;
         std::shared_ptr<BufferAllocatorBase> allocator;
-        std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+        std::vector<CoreUniquePtr<AllocatedBuffer>> buffers;
         auto& descriptors = nof_descriptors[segment];
         if (!descriptors.empty()) {
             std::vector<LiveAllocation> allocations;
@@ -5014,11 +5015,11 @@ auto MasterService::AllocateReplicas(const std::string& key,
                                      const ReplicateConfig& config,
                                      const std::string& writer_host_id,
                                      bool* dfs_allocation_failed)
-    -> tl::expected<std::vector<Replica>, ErrorCode> {
+    -> tl::expected<ReplicaVector, ErrorCode> {
     if (dfs_allocation_failed != nullptr) {
         *dfs_allocation_failed = false;
     }
-    std::vector<Replica> replicas;
+    ReplicaVector replicas;
     const auto write_mode = DetermineReplicaWriteMode(config);
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
@@ -5200,8 +5201,8 @@ auto MasterService::InsertMetadata(
     MetadataAccessorRW& accessor, const UUID& client_id, uint64_t value_length,
     const ReplicateConfig& config, const std::string& group_id,
     const std::chrono::system_clock::time_point& now,
-    const ResolvedSoftPinRequest& soft_pin_request,
-    std::vector<Replica>&& replicas, uint64_t pending_quota_charge,
+    const ResolvedSoftPinRequest& soft_pin_request, ReplicaVector&& replicas,
+    uint64_t pending_quota_charge,
     std::optional<std::chrono::system_clock::time_point>
         committed_soft_pin_timeout)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
@@ -5760,8 +5761,8 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
         accessor.Publish(
             client_id, std::chrono::system_clock::now(),
             replica.get_descriptor().get_local_disk_descriptor().object_size,
-            std::vector<Replica>{}, std::nullopt, false,
-            ObjectDataType::UNKNOWN, std::string{}, object_id.tenant_id, key);
+            ReplicaVector{}, std::nullopt, false, ObjectDataType::UNKNOWN,
+            std::string{}, object_id.tenant_id, key);
     }
     auto& metadata = accessor.Get();
     const auto previous_kv_media = KvMediaSnapshot(metadata);
@@ -5812,7 +5813,7 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     }
 
     if (!replacing_existing) {
-        std::vector<Replica> replicas;
+        ReplicaVector replicas;
         replicas.emplace_back(std::move(replica));
         metadata.AddReplicas(std::move(replicas));
         accessor.OnDiskReplicaAdded(metadata);
@@ -6320,7 +6321,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // descriptors. Allocate the replacement before removing the
                 // old metadata so an allocation failure leaves the old object
                 // readable instead of turning it into OBJECT_NOT_FOUND.
-                std::optional<std::vector<Replica>> replacement_replicas;
+                std::optional<ReplicaVector> replacement_replicas;
                 uint64_t replacement_pending_quota_charge = 0;
                 if (has_read_lease) {
                     replacement_pending_quota_charge =
@@ -6820,7 +6821,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
         ReleaseTenantQuota(quota_account, pending_quota_charge);
     };
 
-    std::vector<Replica> replicas;
+    ReplicaVector replicas;
     replicas.reserve(new_replica_count);
     std::vector<std::string> new_target_segments;
     new_target_segments.reserve(new_replica_count);
@@ -7224,7 +7225,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
-    std::vector<Replica> replicas;
+    ReplicaVector replicas;
     // See CopyStart: target allocation owns its own Client guard and must not
     // be nested under the source executor's guard. The metadata shard keeps
     // terminal cleanup ordered after this already-admitted MoveStart.
@@ -8674,7 +8675,7 @@ auto MasterService::NotifyOffloadSuccess(
                         refused_unmounted = true;
                     } else if (!obj_metadata.HasReplica(
                                    &Replica::fn_is_local_disk_replica)) {
-                        std::vector<Replica> replicas;
+                        ReplicaVector replicas;
                         replicas.emplace_back(std::move(replica));
                         obj_metadata.AddReplicas(std::move(replicas));
                         accessor.OnDiskReplicaAdded(obj_metadata);
@@ -9460,7 +9461,7 @@ auto MasterService::PromotionAllocStart(
         config.preferred_segments = preferred_segments;
     }
 
-    std::vector<Replica> staged_replicas;
+    ReplicaVector staged_replicas;
     // Allocation is guarded by the selected memory Segment owner. Release the
     // holder guard first so a co-located holder cannot self-deadlock and two
     // Clients cannot form a source/target lock cycle. The holder operation was
@@ -9493,7 +9494,7 @@ auto MasterService::PromotionAllocStart(
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     const ReplicaID new_id = staged_replicas[0].id();
-    std::vector<Replica> to_add;
+    ReplicaVector to_add;
     to_add.push_back(std::move(staged_replicas[0]));
     metadata.AddReplicas(std::move(to_add));
 
@@ -10174,7 +10175,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     };
     auto evict_replicas =
         [&, this](TenantQuotaHandle quota_account, ObjectMetadata& metadata,
-                  std::vector<std::vector<Replica>>& deferred_replicas) {
+                  std::vector<ReplicaVector>& deferred_replicas) {
             const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
             auto replicas = PopReplicasWithCacheTotalAccounting(
                 metadata, is_evictable_memory_replica);
@@ -10211,7 +10212,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                                           ObjectMetadata& metadata,
                                           TenantQuotaHandle quota_account,
                                           route::ObjectState& state,
-                                          std::vector<std::vector<Replica>>&
+                                          std::vector<ReplicaVector>&
                                               deferred_replicas) {
         if (!offload_on_evict_) {
             return evict_replicas(quota_account, metadata, deferred_replicas);
@@ -10264,7 +10265,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
 
     auto try_evict_group_or_object =
         [&, this](const std::string& key, bool allow_soft_pinned,
-                  std::vector<std::vector<Replica>>& deferred_replicas)
+                  std::vector<ReplicaVector>& deferred_replicas)
         -> TenantQuotaEvictionResult {
         // Snapshot grouped-ness under the trigger's lock; it is let go of
         // before any member is held (see EvictGroupOrObject).
@@ -10373,7 +10374,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         std::rotate(candidate_keys.begin(),
                     candidate_keys.begin() + randomIndex(candidate_keys.size()),
                     candidate_keys.end());
-        std::vector<std::vector<Replica>> deferred_replicas;
+        std::vector<ReplicaVector> deferred_replicas;
         for (const auto& key : candidate_keys) {
             if (total.freed_bytes >= target_bytes) {
                 break;
@@ -10446,7 +10447,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     auto evict_replicas =
         [&, this](TenantQuotaHandle quota_account, ObjectMetadata& metadata,
-                  std::vector<std::vector<Replica>>& deferred_replicas) {
+                  std::vector<ReplicaVector>& deferred_replicas) {
             if (enable_oplog_) {
                 return metadata.TotalLength() *
                        metadata.CountReplicas([](const Replica& replica) {
@@ -10495,11 +10496,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // Returns freed bytes. Returns 0 if offload-queued and no additional
     // replicas were evicted (all MEMORY replicas of the key are now pinned).
     auto try_evict_or_offload =
-        [&, this](
-            const TenantId& tenant_id, const std::string& key,
-            ObjectMetadata& metadata, TenantQuotaHandle quota_account,
-            route::ObjectState& state,
-            std::vector<std::vector<Replica>>& deferred_replicas) -> uint64_t {
+        [&, this](const TenantId& tenant_id, const std::string& key,
+                  ObjectMetadata& metadata, TenantQuotaHandle quota_account,
+                  route::ObjectState& state,
+                  std::vector<ReplicaVector>& deferred_replicas) -> uint64_t {
         if (enable_oplog_) {
             return evict_replicas(quota_account, metadata, deferred_replicas);
         }
@@ -10643,10 +10643,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // re-looking-up and re-validating each under its own key, so no two
     // evictions wait on each other's keys.
     auto try_evict_group_or_object =
-        [&, this](const TenantId& tenant_id, const std::string& key,
-                  bool allow_soft_pinned,
-                  std::vector<std::vector<Replica>>& deferred_replicas)
-        -> EvictionResult {
+        [&, this](
+            const TenantId& tenant_id, const std::string& key,
+            bool allow_soft_pinned,
+            std::vector<ReplicaVector>& deferred_replicas) -> EvictionResult {
         // Snapshot grouped-ness/membership under the trigger's lock; it is let
         // go of before any member is held.
         std::string group_id;
@@ -10979,7 +10979,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     uint64_t total_freed_size = 0;
     bool stop_eviction_scan = false;
     std::vector<std::chrono::system_clock::time_point> no_pin_objects;
-    std::vector<std::vector<Replica>> deferred_replicas;
+    std::vector<ReplicaVector> deferred_replicas;
     // Shards that actually evicted this cycle; their metadata maps are
     // shrink candidates once eviction finishes.
     std::bitset<kNumShards> evicted_shards;

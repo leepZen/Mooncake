@@ -153,7 +153,7 @@ class PromotionOnHitTest : public ::testing::Test {
         replica->mark_complete();
     }
 
-    static std::unique_ptr<AllocatedBuffer> AllocateOnSegmentForTesting(
+    static CoreUniquePtr<AllocatedBuffer> AllocateOnSegmentForTesting(
         MasterService* service, const UUID& segment_id, size_t size) {
         std::shared_ptr<BufferAllocatorBase> allocator;
         {

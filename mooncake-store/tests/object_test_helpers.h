@@ -29,7 +29,7 @@ inline route::Generation PublishEnvelope(const route::WriteGuard& guard,
                                          const std::string& group_id = {}) {
     const auto write_time =
         std::chrono::system_clock::time_point(std::chrono::seconds(1));
-    return guard.Publish(UUID{1, 2}, write_time, 128, std::vector<Replica>{},
+    return guard.Publish(UUID{1, 2}, write_time, 128, ReplicaVector{},
                          std::nullopt, false, ObjectDataType::UNKNOWN, group_id,
                          TenantId(), guard.key());
 }

@@ -15,6 +15,7 @@
 #include "offset_allocator/offset_allocator.h"
 #include "storage_usage.h"
 #include "types.h"
+#include "metadata/kv_core_heap_accounting.h"
 
 using facebook::cachelib::MemoryAllocator;
 using facebook::cachelib::PoolId;
@@ -165,10 +166,10 @@ class AllocatedBuffer {
     // MasterService constructor, before any reader.
     SegmentLifetime segment_lifetime_;
     std::shared_ptr<ClientLivenessRecord> client_liveness_;
-    std::string segment_name_;
+    CoreString segment_name_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
-    std::string protocol{"tcp"};
+    CoreString protocol{"tcp"};
     // RAII handle for buffer allocated by offset allocator
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
         std::nullopt};
@@ -185,7 +186,7 @@ class BufferAllocatorBase {
    public:
     virtual ~BufferAllocatorBase() = default;
 
-    virtual std::unique_ptr<AllocatedBuffer> allocate(size_t size) = 0;
+    virtual CoreUniquePtr<AllocatedBuffer> allocate(size_t size) = 0;
     virtual void deallocate(AllocatedBuffer* handle) = 0;
     virtual size_t capacity() const = 0;
     virtual size_t size() const = 0;
@@ -262,7 +263,7 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
         : segment_name_(std::move(segment_name)),
           transport_endpoint_(std::move(transport_endpoint)) {}
 
-    std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
+    CoreUniquePtr<AllocatedBuffer> allocate(size_t size) override {
         return nullptr;
     }
     void deallocate(AllocatedBuffer* handle) override {}
@@ -310,7 +311,7 @@ class CachelibBufferAllocator
 
     ~CachelibBufferAllocator() override;
 
-    std::unique_ptr<AllocatedBuffer> allocate(size_t size) override;
+    CoreUniquePtr<AllocatedBuffer> allocate(size_t size) override;
 
     void deallocate(AllocatedBuffer* handle) override;
 
@@ -336,7 +337,7 @@ class CachelibBufferAllocator
                             std::string transport_endpoint,
                             ReplicaType replica_type);
 
-    std::unique_ptr<AllocatedBuffer> adoptImportedBuffer(
+    CoreUniquePtr<AllocatedBuffer> adoptImportedBuffer(
         const LiveAllocation& allocation);
     // metadata
     const std::string segment_name_;
@@ -364,7 +365,7 @@ class CachelibBufferAllocator
 
 struct RestoredCachelibBufferAllocator {
     std::shared_ptr<CachelibBufferAllocator> allocator;
-    std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+    std::vector<CoreUniquePtr<AllocatedBuffer>> buffers;
 };
 
 std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
@@ -388,7 +389,7 @@ class OffsetBufferAllocator
 
     ~OffsetBufferAllocator() override;
 
-    std::unique_ptr<AllocatedBuffer> allocate(size_t size) override;
+    CoreUniquePtr<AllocatedBuffer> allocate(size_t size) override;
 
     void deallocate(AllocatedBuffer* handle) override;
 
@@ -425,7 +426,7 @@ class OffsetBufferAllocator
 
 struct RestoredOffsetBufferAllocator {
     std::shared_ptr<OffsetBufferAllocator> allocator;
-    std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+    std::vector<CoreUniquePtr<AllocatedBuffer>> buffers;
 };
 
 // Reconstructs an empty OffsetBufferAllocator from final live allocations.

@@ -742,10 +742,9 @@ TEST(ObjectRouteDeathTest, PublishOfAnotherKeysMetadataAborts) {
     EXPECT_DEATH(
         {
             auto guard = route.WriteKey("k1");
-            (void)guard.Publish(UUID{1, 2}, write_time, 128,
-                                std::vector<Replica>{}, std::nullopt, false,
-                                ObjectDataType::UNKNOWN, std::string(),
-                                TenantId(), std::string("k2"));
+            (void)guard.Publish(UUID{1, 2}, write_time, 128, ReplicaVector{},
+                                std::nullopt, false, ObjectDataType::UNKNOWN,
+                                std::string(), TenantId(), std::string("k2"));
         },
         "of an object keyed k2");
 }

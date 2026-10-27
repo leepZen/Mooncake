@@ -11,7 +11,7 @@ class ScopedSegmentAccess;
 class SegmentAllocatorRegistration {
    public:
     [[nodiscard]] bool IsServing() const;
-    [[nodiscard]] std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const;
+    [[nodiscard]] CoreUniquePtr<AllocatedBuffer> Allocate(size_t size) const;
     [[nodiscard]] std::shared_ptr<BufferAllocatorBase> GetAllocator() const;
 
    private:

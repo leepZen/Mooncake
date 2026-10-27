@@ -89,7 +89,7 @@ class ReplicaAllocator final {
    public:
     explicit ReplicaAllocator(Policy policy) : policy_(std::move(policy)) {}
 
-    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+    tl::expected<ReplicaVector, ErrorCode> Allocate(
         ScopedPlacementReadAccess& placement,
         const ReplicaAllocationRequest& request,
         PlacementDiagnostics* diagnostics = nullptr) const;

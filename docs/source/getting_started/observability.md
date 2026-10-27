@@ -48,6 +48,24 @@ The metrics block consists of the following sections:
 | `soft-pinned` | Number of keys with active soft-pin leases (protected from eviction) |
 | `Clients` | Number of currently connected clients |
 
+#### KV Core Metadata Heap
+
+`kv_core_heap_bytes` is the current outstanding heap allocation request size,
+in bytes, for core KV metadata. It appears after `Keys` in the INFO summary
+and is also exported as a gauge with the same name at `/metrics`.
+
+It includes tenant/object map nodes and buckets, persistent key and attribution
+strings, object parts, replica arrays, allocated-buffer descriptors, and shared
+lease allocations. Allocation and deallocation update one atomic account;
+reporting does not scan keys. Retained container capacity and core replicas
+awaiting deferred release remain counted until their allocations are freed.
+
+The metric excludes embedded fixed structures, value data, segment allocator
+management arrays, auxiliary indexes/tasks, standby storage, and HA buffers.
+It measures allocation requests rather than allocator rounding or resident
+pages, so it must not be interpreted as process RSS. Service replacement does
+not reset the account while allocations from the previous service remain alive.
+
 #### Requests (Success/Total per sec)
 
 Rate counters for individual (non-batch) RPC requests over the last time window. Each shows `<success_rate>/<total_rate>` in requests per second:

@@ -48,6 +48,7 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using mooncake::AllocatedBuffer;
 using mooncake::AllocatorManager;
+using mooncake::CoreUniquePtr;
 using mooncake::OffsetBufferAllocator;
 using mooncake::RandomAllocationStrategy;
 using mooncake::ReplicaType;
@@ -334,7 +335,7 @@ class PutAllocationFixture {
     std::shared_ptr<OffsetBufferAllocator> allocator_;
     AllocatorManager allocator_manager_;
     RandomAllocationStrategy strategy_;
-    std::vector<std::unique_ptr<AllocatedBuffer>> held_;
+    std::vector<CoreUniquePtr<AllocatedBuffer>> held_;
 };
 
 template <typename Fixture>

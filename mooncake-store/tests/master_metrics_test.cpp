@@ -145,6 +145,28 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     ASSERT_EQ(metrics.get_put_start_discarded_staging_size(), 0);
 }
 
+TEST_F(MasterMetricsTest, CoreHeapAccountIsReportedWithoutScanningObjects) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto before = GetMasterCoreHeapAccount().Load();
+    {
+        CoreVector<uint64_t> allocation;
+        allocation.reserve(32);
+        const auto expected = before + allocation.capacity() * sizeof(uint64_t);
+        const auto summary = metrics.get_summary_string();
+        EXPECT_NE(
+            summary.find(" | kv_core_heap_bytes=" + std::to_string(expected)),
+            std::string::npos);
+        const auto text = metrics.serialize_metrics();
+        EXPECT_NE(text.find("# TYPE kv_core_heap_bytes gauge\n"),
+                  std::string::npos);
+        EXPECT_NE(text.find("\nkv_core_heap_bytes " + std::to_string(expected) +
+                            "\n"),
+                  std::string::npos);
+        EXPECT_EQ(GetMasterCoreHeapAccount().Load(), expected);
+    }
+    EXPECT_EQ(GetMasterCoreHeapAccount().Load(), before);
+}
+
 TEST_F(MasterMetricsTest, ClientOffboardingMetricsAreExported) {
     auto& metrics = MasterMetricManager::instance();
     metrics.inc_client_offboarding_alert();

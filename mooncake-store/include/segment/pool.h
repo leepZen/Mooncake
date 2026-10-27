@@ -31,7 +31,7 @@ class SegmentPool final {
 
     // Holds the Pool read lock through candidate selection and allocation.
     template <ReplicaPlacementPolicy Policy = RandomPlacementPolicy>
-    tl::expected<std::vector<Replica>, ErrorCode> AllocateReplicas(
+    tl::expected<ReplicaVector, ErrorCode> AllocateReplicas(
         const ReplicaAllocationRequest& request, Policy policy = {},
         PlacementDiagnostics* diagnostics = nullptr) const {
         auto access = AcquirePlacementAccess();

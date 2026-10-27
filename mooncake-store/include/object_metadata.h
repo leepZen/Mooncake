@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "lease.h"
+#include "metadata/kv_core_tenant_id.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "object_part.h"
@@ -69,7 +70,7 @@ struct ObjectMetadata {
 
     ObjectMetadata(const UUID& client_id_,
                    const std::chrono::system_clock::time_point put_start_time_,
-                   size_t value_length, std::vector<Replica>&& reps,
+                   size_t value_length, ReplicaVector&& reps,
                    std::optional<std::chrono::system_clock::time_point>
                        committed_soft_pin_timeout = std::nullopt,
                    bool enable_hard_pin = false,
@@ -102,12 +103,12 @@ struct ObjectMetadata {
     // Updated by UpsertStart (Case B) to reset the discard timeout.
     std::chrono::system_clock::time_point put_start_time;
     const ObjectDataType data_type{ObjectDataType::UNKNOWN};
-    const std::string group_id;
-    const TenantId tenant_id;
-    const std::string user_key;
+    const CoreString group_id;
+    const CoreTenantId tenant_id;
+    const CoreString user_key;
 
     // Committed attribution only; protected by the owning metadata shard lock.
-    std::string session_id;
+    CoreString session_id;
     struct PendingSessionTag {
         std::string session_id;
         std::unordered_set<ReplicaID> eligible_replica_ids;
@@ -146,7 +147,7 @@ struct ObjectMetadata {
     // Authoritative lease: ungrouped objects own one; grouped objects share
     // the group's. Never null after construction.
     mutable std::shared_ptr<Lease> lease_ GUARDED_BY(lock) =
-        std::make_shared<Lease>();
+        MakeCoreShared<Lease>();
     mutable std::optional<std::chrono::system_clock::time_point>
         soft_pin_timeout GUARDED_BY(lock);  // committed object soft-pin
                                             // deadline
@@ -222,16 +223,16 @@ struct ObjectMetadata {
     // Temporary: these operate on part 0. The multi-part work replaces them
     // with `parts()` and a flattened `replicas()` view, so each call site says
     // which it means.
-    void AddReplicas(std::vector<Replica>&& replicas) {
+    void AddReplicas(ReplicaVector&& replicas) {
         MutablePart(0).AddReplicas(std::move(replicas));
     }
 
-    std::vector<Replica> PopReplicas(
+    ReplicaVector PopReplicas(
         const std::function<bool(const Replica&)>& pred_fn) {
         return MutablePart(0).PopReplicas(pred_fn);
     }
 
-    std::vector<Replica> PopReplicas() { return MutablePart(0).PopReplicas(); }
+    ReplicaVector PopReplicas() { return MutablePart(0).PopReplicas(); }
 
     size_t EraseReplicas(const std::function<bool(const Replica&)>& pred_fn) {
         return MutablePart(0).PopReplicas(pred_fn).size();
@@ -508,7 +509,7 @@ struct ObjectMetadata {
     }
 
    private:
-    std::vector<ObjectPart> parts_;
+    CoreVector<ObjectPart> parts_;
 };
 
 }  // namespace mooncake

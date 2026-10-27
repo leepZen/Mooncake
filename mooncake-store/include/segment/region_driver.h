@@ -62,7 +62,7 @@ class RegionDriver {
 
     PreparedRegionResource Stage(
         const UUID& id, std::unique_ptr<RegionResource> resource,
-        std::vector<std::unique_ptr<AllocatedBuffer>> imported_buffers = {});
+        std::vector<CoreUniquePtr<AllocatedBuffer>> imported_buffers = {});
 
    private:
     using ResourceMap = std::map<UUID, std::unique_ptr<RegionResource>>;
@@ -87,16 +87,16 @@ class RegionDriver::PreparedRegionResource final {
 
     // The staged resource remains valid until Commit() or a move.
     RegionResource& resource() const noexcept;
-    const std::vector<std::unique_ptr<AllocatedBuffer>>& imported_buffers()
+    const std::vector<CoreUniquePtr<AllocatedBuffer>>& imported_buffers()
         const noexcept;
-    std::vector<std::unique_ptr<AllocatedBuffer>> TakeImportedBuffers();
+    std::vector<CoreUniquePtr<AllocatedBuffer>> TakeImportedBuffers();
 
     void Commit() noexcept;
 
     PreparedRegionResource(
         StageKey, RegionDriver& driver, const UUID& id,
         std::unique_ptr<RegionResource> resource,
-        std::vector<std::unique_ptr<AllocatedBuffer>> imported_buffers);
+        std::vector<CoreUniquePtr<AllocatedBuffer>> imported_buffers);
 
    private:
     struct State;

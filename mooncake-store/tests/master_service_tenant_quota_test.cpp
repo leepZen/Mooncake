@@ -67,7 +67,7 @@ class BlockingAllocationStrategy final : public AllocationStrategy {
 
     void AllowAllocation() { allow_allocation_promise_.set_value(); }
 
-    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+    tl::expected<ReplicaVector, ErrorCode> Allocate(
         const AllocatorManager& allocator_manager, const size_t slice_length,
         const size_t replica_num,
         const std::vector<std::string>& preferred_segments,

@@ -47,7 +47,7 @@ class BlockingAllocateOffsetBufferAllocator : public OffsetBufferAllocator {
         : OffsetBufferAllocator(std::move(segment_name), base, size,
                                 std::move(transport_endpoint)) {}
 
-    std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
+    CoreUniquePtr<AllocatedBuffer> allocate(size_t size) override {
         entered_.release();
         resume_.acquire();
         return OffsetBufferAllocator::allocate(size);

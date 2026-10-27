@@ -19,7 +19,7 @@ bool SegmentAllocatorRegistration::IsServing() const {
     return !record || record->IsServing();
 }
 
-std::unique_ptr<AllocatedBuffer> SegmentAllocatorRegistration::Allocate(
+CoreUniquePtr<AllocatedBuffer> SegmentAllocatorRegistration::Allocate(
     size_t size) const {
     if (!allocation_lifetime_.isAvailable()) {
         return nullptr;

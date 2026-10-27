@@ -1019,7 +1019,7 @@ TEST(SegmentPoolTest, DestroyedPoolAndRetainedAllocatorRemoveMetricLabels) {
         const std::string name = "retained-allocator-labels";
         const std::string label = "segment=\"" + name + "\"";
         std::shared_ptr<BufferAllocatorBase> retained;
-        std::unique_ptr<AllocatedBuffer> live;
+        CoreUniquePtr<AllocatedBuffer> live;
         {
             SegmentPool pool(Drivers());
             auto segment = MakeSegment(0, name);

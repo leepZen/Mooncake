@@ -132,7 +132,7 @@ class EvictorTest : public ::testing::Test {
                  int replicas = 1) {
         metadata::Namespace& ns = namespaces_.GetOrCreate(TenantId(tenant));
         auto guard = ns.objects.WriteKey(key);
-        std::vector<Replica> list;
+        ReplicaVector list;
         for (int i = 0; i < replicas; ++i) {
             list.emplace_back(allocator_->allocate(128),
                               ReplicaStatus::COMPLETE);
@@ -166,7 +166,7 @@ class EvictorTest : public ::testing::Test {
         auto hold =
             namespaces_.GetOrCreate(TenantId(tenant)).objects.Write(key);
         ASSERT_TRUE(hold.has_value());
-        std::vector<Replica> list;
+        ReplicaVector list;
         for (int i = 0; i < count; ++i) {
             list.emplace_back(allocator_->allocate(128),
                               ReplicaStatus::COMPLETE);
@@ -385,7 +385,7 @@ TEST_F(EvictorTest, AReplacedDeferredObjectIsLeftAlone) {
         auto hold = ns.objects.Write("pinned");
         ASSERT_TRUE(hold.has_value());
         hold->TearDown();
-        std::vector<Replica> list;
+        ReplicaVector list;
         list.emplace_back(allocator_->allocate(128), ReplicaStatus::COMPLETE);
         (void)hold->Publish(UUID{1, 2}, Clock::time_point{}, 128,
                             std::move(list), std::nullopt, false,
@@ -446,7 +446,7 @@ TEST_F(EvictorTest, AMemberReplacedBeforeItsTurnIsLeftAlone) {
         auto hold = ns.objects.Write(replaced);
         ASSERT_TRUE(hold.has_value());
         hold->TearDown();
-        std::vector<Replica> list;
+        ReplicaVector list;
         list.emplace_back(allocator_->allocate(128), ReplicaStatus::COMPLETE);
         (void)hold->Publish(UUID{1, 2}, Clock::time_point{}, 128,
                             std::move(list), std::nullopt, false,
@@ -598,7 +598,7 @@ TEST_F(OffloadingReclaimerTest, AnObjectOnLocalDiskIsDemotedWithoutOffload) {
     Publish("a", "k", seconds(10));
     {
         auto hold = namespaces_.GetOrCreate(TenantId("a")).objects.Write("k");
-        std::vector<Replica> disk;
+        ReplicaVector disk;
         disk.emplace_back(UUID{3, 4}, 128, "endpoint", ReplicaStatus::COMPLETE);
         hold->metadata().AddReplicas(std::move(disk));
     }
@@ -617,7 +617,7 @@ TEST_F(OffloadingReclaimerTest,
     Publish("a", "k", seconds(10));
     {
         auto hold = namespaces_.GetOrCreate(TenantId("a")).objects.Write("k");
-        std::vector<Replica> disk;
+        ReplicaVector disk;
         disk.emplace_back(UUID{3, 4}, 128, "endpoint", ReplicaStatus::COMPLETE);
         disk.back().mark_removed();
         hold->metadata().AddReplicas(std::move(disk));

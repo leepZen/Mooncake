@@ -28,7 +28,7 @@ class ObjectPart {
     ObjectPart(ObjectPart&&) noexcept = default;
     ObjectPart& operator=(ObjectPart&&) = delete;
 
-    ObjectPart(size_t length, std::vector<Replica>&& replicas)
+    ObjectPart(size_t length, ReplicaVector&& replicas)
         : length_(length), replicas_(std::move(replicas)) {}
 
     size_t length() const { return length_; }
@@ -44,7 +44,7 @@ class ObjectPart {
     std::span<Replica> replicas() { return replicas_; }
     std::span<const Replica> replicas() const { return replicas_; }
 
-    void AddReplicas(std::vector<Replica>&& replicas) {
+    void AddReplicas(ReplicaVector&& replicas) {
         replicas_.insert(replicas_.end(), std::move_iterator(replicas.begin()),
                          std::move_iterator(replicas.end()));
     }
@@ -52,12 +52,12 @@ class ObjectPart {
     // What comes back is out of the part: the caller owns those replicas and
     // decides how to isolate, defer or release them.
     template <typename Pred>
-    [[nodiscard]] std::vector<Replica> PopReplicas(Pred&& pred) {
+    [[nodiscard]] ReplicaVector PopReplicas(Pred&& pred) {
         auto partition_point = std::partition(
             replicas_.begin(), replicas_.end(),
             [&pred](const Replica& replica) { return !pred(replica); });
 
-        std::vector<Replica> popped_replicas;
+        ReplicaVector popped_replicas;
         if (partition_point != replicas_.end()) {
             popped_replicas.reserve(
                 std::distance(partition_point, replicas_.end()));
@@ -69,14 +69,12 @@ class ObjectPart {
         return popped_replicas;
     }
 
-    [[nodiscard]] std::vector<Replica> PopReplicas() {
-        return std::move(replicas_);
-    }
+    [[nodiscard]] ReplicaVector PopReplicas() { return std::move(replicas_); }
 
    private:
     const size_t length_;
     std::optional<uint64_t> checksum_;
-    std::vector<Replica> replicas_;
+    ReplicaVector replicas_;
 };
 
 }  // namespace mooncake

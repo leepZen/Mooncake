@@ -63,11 +63,10 @@ class FakeStore final : public StoreControl {
     std::vector<std::pair<TenantId, uint64_t>> evictions;
 };
 
-std::vector<Replica> MemoryReplicas(
-    std::initializer_list<ReplicaStatus> statuses) {
-    std::vector<Replica> replicas;
+ReplicaVector MemoryReplicas(std::initializer_list<ReplicaStatus> statuses) {
+    ReplicaVector replicas;
     for (const ReplicaStatus status : statuses) {
-        replicas.emplace_back(std::unique_ptr<AllocatedBuffer>{}, status);
+        replicas.emplace_back(CoreUniquePtr<AllocatedBuffer>{}, status);
     }
     return replicas;
 }
@@ -75,7 +74,7 @@ std::vector<Replica> MemoryReplicas(
 // Publishes an object of `length` bytes with `replicas` under the key `guard`
 // holds, which holds no object.
 void PublishUnder(const route::WriteGuard& guard, size_t length,
-                  std::vector<Replica> replicas) {
+                  ReplicaVector replicas) {
     guard.Publish(
         UUID{1, 2},
         std::chrono::system_clock::time_point(std::chrono::seconds(1)), length,
@@ -171,7 +170,7 @@ class TenantQuotaPolicyTest : public ::testing::Test {
 };
 
 TEST(TenantQuotaPolicyChargeTest, ChargesEveryMemoryReplicaThatHoldsMemory) {
-    std::vector<Replica> replicas =
+    ReplicaVector replicas =
         MemoryReplicas({ReplicaStatus::INITIALIZED, ReplicaStatus::PROCESSING,
                         ReplicaStatus::COMPLETE, ReplicaStatus::REMOVED,
                         ReplicaStatus::FAILED});

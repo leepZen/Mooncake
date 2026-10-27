@@ -37,6 +37,7 @@ function(add_ha_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+add_store_test(kv_core_heap_accounting_test kv_core_heap_accounting_test.cpp)
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(weight_management_contract_test
                weight_management_contract_test.cpp)

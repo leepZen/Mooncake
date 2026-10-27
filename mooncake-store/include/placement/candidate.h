@@ -22,7 +22,7 @@ class AllocationCandidate {
    public:
     virtual ~AllocationCandidate() = default;
 
-    virtual std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const = 0;
+    virtual CoreUniquePtr<AllocatedBuffer> Allocate(size_t size) const = 0;
     virtual AllocationCandidateKind Kind() const noexcept = 0;
 
     size_t Capacity() const { return allocator_->capacity(); }

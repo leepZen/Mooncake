@@ -48,7 +48,7 @@ struct Effect {
     // The object holds nothing valid any more and must be torn down.
     bool needs_teardown = false;
     // The replicas taken off the object, freed when this is destroyed.
-    std::vector<Replica> detached;
+    ReplicaVector detached;
 
     Effect() = default;
     Effect(Effect&&) = default;
