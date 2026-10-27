@@ -10,8 +10,8 @@
 //
 // It has no ownership lock: whoever owns the envelope decides how the
 // envelope as a whole is guarded. The `lock` member below is internal and
-// narrower — it protects only `lease_` and `soft_pin_timeout`, so a holder of
-// the envelope can read either without them tearing.
+// narrower — it protects only `lease_`, `last_access_time` and `soft_pin_ttl`,
+// so a holder of the envelope can read either without them tearing.
 
 #include <algorithm>
 #include <chrono>
@@ -43,12 +43,30 @@ struct ResolvedSoftPinRequest {
     std::chrono::milliseconds ttl{0};
 };
 
+// Carried soft-pin state when an existing object's metadata is rebuilt (e.g.
+// a size-changing upsert). The sliding window is reconstructed as
+// `last_access_time + soft_pin_ttl`; `soft_pin_ttl == 0` means not pinned.
+struct CommittedSoftPinState {
+    std::chrono::system_clock::time_point last_access_time;
+    std::chrono::milliseconds soft_pin_ttl{0};
+};
+
 struct ObjectMetadata {
     struct SoftPinEvaluation {
         bool active{false};
         int metric_delta{0};
         std::optional<std::chrono::system_clock::time_point> removed_deadline;
         std::optional<std::chrono::system_clock::time_point> deadline_to_index;
+    };
+
+    // Three-state outcome of the background renewal check. Encapsulated here
+    // so the object spin lock serializes the effective-deadline read and any
+    // state transition (see EvaluateSoftPinAtExpiry).
+    enum class SoftPinExpiryAction { kRenew, kExpire, kAlreadyCleared };
+
+    struct SoftPinExpiryEvaluation {
+        SoftPinExpiryAction action{SoftPinExpiryAction::kAlreadyCleared};
+        std::chrono::system_clock::time_point new_deadline;
     };
 
     struct PendingSoftPinAction {
@@ -60,7 +78,7 @@ struct ObjectMetadata {
     // RAII-style metric management
     ~ObjectMetadata() {
         MasterMetricManager::instance().dec_key_count(1);
-        if (soft_pin_timeout) {
+        if (soft_pin_ttl != std::chrono::milliseconds::zero()) {
             MasterMetricManager::instance().dec_soft_pin_key_count(1);
         }
     }
@@ -70,8 +88,8 @@ struct ObjectMetadata {
     ObjectMetadata(const UUID& client_id_,
                    const std::chrono::system_clock::time_point put_start_time_,
                    size_t value_length, std::vector<Replica>&& reps,
-                   std::optional<std::chrono::system_clock::time_point>
-                       committed_soft_pin_timeout = std::nullopt,
+                   std::optional<CommittedSoftPinState> committed_soft_pin =
+                       std::nullopt,
                    bool enable_hard_pin = false,
                    ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
                    std::string group_id_ = "", TenantId tenant_id_ = TenantId(),
@@ -82,11 +100,16 @@ struct ObjectMetadata {
           group_id(std::move(group_id_)),
           tenant_id(std::move(tenant_id_)),
           user_key(std::move(user_key_)),
-          soft_pin_timeout(std::move(committed_soft_pin_timeout)),
+          last_access_time(committed_soft_pin
+                               ? committed_soft_pin->last_access_time
+                               : put_start_time_),
+          soft_pin_ttl(committed_soft_pin
+                           ? committed_soft_pin->soft_pin_ttl
+                           : std::chrono::milliseconds::zero()),
           hard_pinned(enable_hard_pin) {
         parts_.emplace_back(value_length, std::move(reps));
         MasterMetricManager::instance().inc_key_count(1);
-        if (soft_pin_timeout) {
+        if (soft_pin_ttl != std::chrono::milliseconds::zero()) {
             MasterMetricManager::instance().inc_soft_pin_key_count(1);
         }
         MasterMetricManager::instance().observe_value_size(value_length);
@@ -147,9 +170,12 @@ struct ObjectMetadata {
     // the group's. Never null after construction.
     mutable std::shared_ptr<Lease> lease_ GUARDED_BY(lock) =
         std::make_shared<Lease>();
-    mutable std::optional<std::chrono::system_clock::time_point>
-        soft_pin_timeout GUARDED_BY(lock);  // committed object soft-pin
-                                            // deadline
+    // Sliding soft-pin window: active iff soft_pin_ttl != 0, with
+    // effective_deadline = last_access_time + soft_pin_ttl. Both are
+    // runtime-only (never persisted).
+    mutable std::chrono::system_clock::time_point last_access_time
+        GUARDED_BY(lock);
+    mutable std::chrono::milliseconds soft_pin_ttl{0} GUARDED_BY(lock);
     // Replica IDs scope this action to the current write. PutEnd does not
     // carry a generation token, so a stale End from the same client cannot
     // otherwise be distinguished from the current write.
@@ -271,9 +297,9 @@ struct ObjectMetadata {
         return std::ranges::any_of(GetPart(0).replicas(), pred_fn);
     }
 
-    // Whether the object is backed by NoF replicas only, with no memory or disk
-    // replica keeping it resident. Such an object can be reclaimed as soon as
-    // its soft pin expires.
+    // True iff the object is backed by NoF replicas only, with no memory or
+    // disk replica keeping it resident. Gates both access-based soft pin
+    // renewal and the TTL reclaim of expired pins.
     bool IsNoFOnly() const {
         return HasReplica([](const Replica& replica) {
                    return replica.is_nof_replica();
@@ -345,33 +371,62 @@ struct ObjectMetadata {
         return lease_->ExpiresAt();
     }
 
+    // Active state of the soft pin: soft_pin_ttl != 0. Requires the object spin
+    // lock; unlocked callers use the public accessors below.
+    bool SoftPinActiveLocked() const REQUIRES(lock) {
+        return soft_pin_ttl != std::chrono::milliseconds::zero();
+    }
+
+    // Record a read hit for access-based renewal: overwrite `last_access_time`
+    // under the object spin lock. Called from the read paths (GetReplicaList
+    // et al.) while holding a RO metadata shard lock; never touches the index.
+    void TouchLastAccess() const {
+        SpinLocker locker(&lock);
+        last_access_time = std::chrono::system_clock::now();
+    }
+
     SoftPinEvaluation EvaluateSoftPin(
         const std::chrono::system_clock::time_point& now) const {
         SpinLocker locker(&lock);
-        if (soft_pin_timeout && now >= *soft_pin_timeout) {
-            const auto removed_deadline = *soft_pin_timeout;
-            soft_pin_timeout.reset();
+        if (SoftPinActiveLocked() &&
+            ComputeSoftPinDeadline(last_access_time, soft_pin_ttl) <= now) {
+            const auto removed_deadline =
+                ComputeSoftPinDeadline(last_access_time, soft_pin_ttl);
+            soft_pin_ttl = std::chrono::milliseconds::zero();
             return {.active = false,
                     .metric_delta = -1,
                     .removed_deadline = removed_deadline,
                     .deadline_to_index = std::nullopt};
         }
-        return {.active = soft_pin_timeout.has_value(),
+        return {.active = SoftPinActiveLocked(),
                 .metric_delta = 0,
                 .removed_deadline = std::nullopt,
                 .deadline_to_index = std::nullopt};
     }
 
-    bool ExpireSoftPinIfDeadlineMatches(
-        const std::chrono::system_clock::time_point& expected_deadline,
-        const std::chrono::system_clock::time_point& now) const {
+    // Background renewal check for CleanupExpiredSoftPins: atomically decide
+    // under the object spin lock whether the popped deadline is renewed (the
+    // sliding window moved past `now`), expired, or already cleared by a
+    // concurrent path. `allow_renew` (switch on && NoF-only) is passed in by
+    // the caller; when false, a still-live window is forced to expire to keep
+    // the static-window semantics.
+    SoftPinExpiryEvaluation EvaluateSoftPinAtExpiry(
+        const std::chrono::system_clock::time_point& now,
+        bool allow_renew) const {
         SpinLocker locker(&lock);
-        if (!soft_pin_timeout || *soft_pin_timeout != expected_deadline ||
-            now < expected_deadline) {
-            return false;
+        if (!SoftPinActiveLocked()) {
+            return {.action = SoftPinExpiryAction::kAlreadyCleared,
+                    .new_deadline = std::chrono::system_clock::time_point{}};
         }
-        soft_pin_timeout.reset();
-        return true;
+        const auto deadline =
+            ComputeSoftPinDeadline(last_access_time, soft_pin_ttl);
+        if (allow_renew && deadline > now) {
+            return {.action = SoftPinExpiryAction::kRenew,
+                    .new_deadline = deadline};
+        }
+        soft_pin_ttl = std::chrono::milliseconds::zero();
+        return {.action = SoftPinExpiryAction::kExpire,
+                .new_deadline = std::chrono::system_clock::time_point{}};
     }
 
     // Saturates at the clock's maximum rather than overflowing when the TTL
@@ -387,10 +442,35 @@ struct ObjectMetadata {
         return ttl > remaining ? max_time : now + ttl;
     }
 
-    std::optional<std::chrono::system_clock::time_point>
-    GetCommittedSoftPinTimeout() const {
+    // The current effective soft-pin deadline (saturated), a thin wrapper over
+    // ComputeSoftPinDeadline reading the sliding window. Pure accessor that
+    // acquires the object spin lock; locked call sites reuse the static
+    // ComputeSoftPinDeadline directly to avoid re-entrant locking.
+    std::chrono::system_clock::time_point EffectiveSoftPinDeadline() const {
         SpinLocker locker(&lock);
-        return soft_pin_timeout;
+        return ComputeSoftPinDeadline(last_access_time, soft_pin_ttl);
+    }
+
+    // Snapshot of the committed soft-pin sliding window (last_access_time +
+    // soft_pin_ttl) for metadata rebuild. Returns nullopt when the object is
+    // not soft-pinned.
+    std::optional<CommittedSoftPinState> GetCommittedSoftPinState() const {
+        SpinLocker locker(&lock);
+        if (!SoftPinActiveLocked()) {
+            return std::nullopt;
+        }
+        return CommittedSoftPinState{last_access_time, soft_pin_ttl};
+    }
+
+    // Assign the sliding window so its effective deadline equals `deadline`
+    // exactly. The window is anchored one millisecond before `deadline` with a
+    // one-millisecond TTL, so soft_pin_ttl stays non-zero (active) while
+    // EffectiveSoftPinDeadline() reproduces `deadline`. Used by tests and the
+    // scenario DSL that specify soft-pin state as an absolute expiry.
+    void SetSoftPinDeadline(std::chrono::system_clock::time_point deadline) {
+        SpinLocker locker(&lock);
+        last_access_time = deadline - std::chrono::milliseconds(1);
+        soft_pin_ttl = std::chrono::milliseconds(1);
     }
 
     void BeginSoftPinAction(
@@ -432,9 +512,11 @@ struct ObjectMetadata {
         int metric_delta = 0;
         std::optional<std::chrono::system_clock::time_point> removed_deadline;
         std::optional<std::chrono::system_clock::time_point> deadline_to_index;
-        if (soft_pin_timeout && now >= *soft_pin_timeout) {
-            removed_deadline = *soft_pin_timeout;
-            soft_pin_timeout.reset();
+        if (SoftPinActiveLocked() &&
+            ComputeSoftPinDeadline(last_access_time, soft_pin_ttl) <= now) {
+            removed_deadline =
+                ComputeSoftPinDeadline(last_access_time, soft_pin_ttl);
+            soft_pin_ttl = std::chrono::milliseconds::zero();
             --metric_delta;
         }
 
@@ -443,31 +525,36 @@ struct ObjectMetadata {
                 break;
             case SoftPinAction::ENABLE:
                 if (request.ttl == std::chrono::milliseconds::zero()) {
-                    if (soft_pin_timeout) {
-                        removed_deadline = *soft_pin_timeout;
-                        soft_pin_timeout.reset();
+                    if (SoftPinActiveLocked()) {
+                        removed_deadline =
+                            ComputeSoftPinDeadline(last_access_time,
+                                                   soft_pin_ttl);
+                        soft_pin_ttl = std::chrono::milliseconds::zero();
                         --metric_delta;
                     }
                 } else {
-                    if (!soft_pin_timeout) {
+                    if (!SoftPinActiveLocked()) {
                         ++metric_delta;
                     }
-                    soft_pin_timeout = ComputeSoftPinDeadline(now, request.ttl);
-                    deadline_to_index = soft_pin_timeout;
+                    last_access_time = now;
+                    soft_pin_ttl = request.ttl;
+                    deadline_to_index =
+                        ComputeSoftPinDeadline(now, request.ttl);
                     // Upserting the latest registration supersedes any
                     // expired or previously active deadline.
                     removed_deadline.reset();
                 }
                 break;
             case SoftPinAction::DISABLE:
-                if (soft_pin_timeout) {
-                    removed_deadline = *soft_pin_timeout;
-                    soft_pin_timeout.reset();
+                if (SoftPinActiveLocked()) {
+                    removed_deadline =
+                        ComputeSoftPinDeadline(last_access_time, soft_pin_ttl);
+                    soft_pin_ttl = std::chrono::milliseconds::zero();
                     --metric_delta;
                 }
                 break;
         }
-        return {.active = soft_pin_timeout.has_value(),
+        return {.active = SoftPinActiveLocked(),
                 .metric_delta = metric_delta,
                 .removed_deadline = removed_deadline,
                 .deadline_to_index = deadline_to_index};

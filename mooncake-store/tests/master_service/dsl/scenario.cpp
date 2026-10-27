@@ -1094,7 +1094,13 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
         auto& metadata = metadata_it->second.metadata;
         SpinLocker locker(&metadata.lock);
         metadata.lease_->SetDeadline(action.lease_timeout);
-        metadata.soft_pin_timeout = action.soft_pin_timeout;
+        if (action.soft_pin_timeout.has_value()) {
+            metadata.last_access_time =
+                *action.soft_pin_timeout - std::chrono::milliseconds(1);
+            metadata.soft_pin_ttl = std::chrono::milliseconds(1);
+        } else {
+            metadata.soft_pin_ttl = std::chrono::milliseconds::zero();
+        }
         return true;
     };
 

@@ -14,6 +14,9 @@ allow_evict_soft_pinned_objects: true
 # Reclaims NoF-only objects whose soft pin TTL has expired even though no
 # allocation pressure triggered eviction.
 enable_soft_pin_ttl_reclaim: false
+# Slides the soft pin retention window of NoF-only objects forward on each
+# read hit.
+enable_nof_soft_pin_access_renewal: false
 eviction_ratio: 0.1
 # Overrides the 0.90 code default. A value of 1.0 disables proactive
 # usage-ratio eviction; allocation-failure-triggered eviction remains enabled.
