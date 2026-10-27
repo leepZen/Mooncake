@@ -158,6 +158,9 @@ DEFINE_bool(allow_evict_soft_pinned_objects,
 DEFINE_bool(enable_soft_pin_ttl_reclaim, false,
             "Whether to reclaim NoF-only objects once their soft pin TTL "
             "expires, without waiting for allocation pressure");
+DEFINE_bool(enable_nof_soft_pin_access_renewal, false,
+            "Enable access-based soft pin renewal for NoF-only objects "
+            "(their retention window slides forward on each read hit)");
 DEFINE_validator(default_kv_lease_ttl, ValidateDurationFlag);
 DEFINE_validator(default_kv_soft_pin_ttl, ValidateDurationFlag);
 DEFINE_validator(max_kv_soft_pin_ttl, ValidateDurationFlag);
@@ -564,6 +567,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("enable_soft_pin_ttl_reclaim",
                            &master_config.enable_soft_pin_ttl_reclaim,
                            FLAGS_enable_soft_pin_ttl_reclaim);
+    default_config.GetBool("enable_nof_soft_pin_access_renewal",
+                           &master_config.enable_nof_soft_pin_access_renewal,
+                           FLAGS_enable_nof_soft_pin_access_renewal);
     default_config.GetDouble("eviction_ratio", &master_config.eviction_ratio,
                              FLAGS_eviction_ratio);
     default_config.GetDouble("eviction_high_watermark_ratio",
@@ -902,6 +908,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.enable_soft_pin_ttl_reclaim =
             FLAGS_enable_soft_pin_ttl_reclaim;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_nof_soft_pin_access_renewal",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_nof_soft_pin_access_renewal =
+            FLAGS_enable_nof_soft_pin_access_renewal;
     }
     if ((google::GetCommandLineFlagInfo("eviction_ratio", &info) &&
          !info.is_default) ||
@@ -1595,6 +1608,8 @@ int main(int argc, char* argv[]) {
         << master_config.allow_evict_soft_pinned_objects
         << ", enable_soft_pin_ttl_reclaim="
         << master_config.enable_soft_pin_ttl_reclaim
+        << ", enable_nof_soft_pin_access_renewal="
+        << master_config.enable_nof_soft_pin_access_renewal
         << ", eviction_ratio=" << master_config.eviction_ratio
         << ", eviction_high_watermark_ratio="
         << master_config.eviction_high_watermark_ratio

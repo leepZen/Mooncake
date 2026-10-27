@@ -1596,8 +1596,8 @@ class MasterService {
                         const ResolvedSoftPinRequest& soft_pin_request,
                         std::vector<Replica>&& replicas,
                         uint64_t pending_quota_charge,
-                        std::optional<std::chrono::system_clock::time_point>
-                            committed_soft_pin_timeout = std::nullopt)
+                        std::optional<CommittedSoftPinState>
+                            committed_soft_pin_state = std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     // Helper: allocate replicas, publish the object under the key `accessor`
@@ -1609,8 +1609,8 @@ class MasterService {
         const std::string& writer_host_id, const std::string& group_id,
         const std::chrono::system_clock::time_point& now,
         const ResolvedSoftPinRequest& soft_pin_request,
-        std::optional<std::chrono::system_clock::time_point>
-            committed_soft_pin_timeout = std::nullopt,
+        std::optional<CommittedSoftPinState> committed_soft_pin_state =
+            std::nullopt,
         bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
@@ -1776,6 +1776,9 @@ class MasterService {
     // When true, a soft pin whose TTL expired makes a NoF-only object
     // immediately reclaimable instead of waiting for eviction pressure.
     const bool enable_soft_pin_ttl_reclaim_;
+    // When true, read hits on NoF-only objects slide their soft pin retention
+    // window forward (access-based renewal).
+    const bool enable_nof_soft_pin_access_renewal_;
 
     // Eviction related members
     std::atomic<bool> need_mem_eviction_{

@@ -223,6 +223,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       max_kv_soft_pin_ttl_(config.max_kv_soft_pin_ttl),
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
       enable_soft_pin_ttl_reclaim_(config.enable_soft_pin_ttl_reclaim),
+      enable_nof_soft_pin_access_renewal_(
+          config.enable_nof_soft_pin_access_renewal),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
       tenant_eviction_high_watermark_ratio_(
@@ -2228,7 +2230,7 @@ MasterService::ObjectMap::iterator MasterService::EraseMetadata(
     ReleaseLocalDiskUsage(metadata.GetAllReplicas());
     FreeDfsReplicas(key, metadata.GetAllReplicas());
     AccountCacheTotalRemoval(metadata);
-    if (metadata.GetCommittedSoftPinTimeout()) {
+    if (metadata.GetCommittedSoftPinState()) {
         soft_pin_deadline_index_.Remove(tenant_id.MakeScopedKey(key));
     }
     switch (quota_mode) {
@@ -2503,16 +2505,35 @@ void MasterService::CleanupExpiredSoftPins(
         {
             MetadataAccessorRO accessor(
                 this, ObjectIdentity{std::move(tenant_id), std::move(key)});
-            if (!accessor.IsPublished() ||
-                !accessor.Get().ExpireSoftPinIfDeadlineMatches(entry.deadline,
-                                                               now)) {
+            if (!accessor.IsPublished()) {
                 continue;
+            }
+            const auto& metadata = accessor.Get();
+            const bool is_nof_only = metadata.IsNoFOnly();
+            const bool allow_renew =
+                enable_nof_soft_pin_access_renewal_ && is_nof_only;
+
+            // Lock-protected three-state check: kRenew re-inserts a still-live
+            // sliding-window deadline (metric unchanged); kExpire clears the
+            // pin; kAlreadyCleared skips a slot concurrently released by
+            // another path.
+            const auto state =
+                metadata.EvaluateSoftPinAtExpiry(now, allow_renew);
+            switch (state.action) {
+                case ObjectMetadata::SoftPinExpiryAction::kRenew:
+                    soft_pin_deadline_index_.Upsert(entry.scoped_key,
+                                                    state.new_deadline);
+                    continue;
+                case ObjectMetadata::SoftPinExpiryAction::kAlreadyCleared:
+                    continue;
+                case ObjectMetadata::SoftPinExpiryAction::kExpire:
+                    break;
             }
             ++expired_count;
             // A NoF-only object is not kept resident by any memory or disk
             // replica, so the eviction thread can reclaim it without waiting
             // for allocation pressure.
-            nof_only = candidate && accessor.Get().IsNoFOnly();
+            nof_only = candidate && is_nof_only;
         }
         if (nof_only) {
             std::lock_guard lock(soft_pin_reclaim_queue_mutex_);
@@ -5008,6 +5029,9 @@ auto MasterService::ReadReplicaList(const TenantId& tenant_id,
     // when the client is reading it. Read path is group-agnostic: only the
     // object's own lease is refreshed.
     metadata.GrantReadLease(std::chrono::milliseconds(default_kv_lease_ttl_));
+    if (enable_nof_soft_pin_access_renewal_ && metadata.IsNoFOnly()) {
+        metadata.TouchLastAccess();
+    }
 
     // Promotion-on-hit eligibility: only when no MEMORY replica is
     // present but at least one LOCAL_DISK replica is. Decided here while
@@ -5333,13 +5357,17 @@ auto MasterService::InsertMetadata(
     const std::chrono::system_clock::time_point& now,
     const ResolvedSoftPinRequest& soft_pin_request,
     std::vector<Replica>&& replicas, uint64_t pending_quota_charge,
-    std::optional<std::chrono::system_clock::time_point>
-        committed_soft_pin_timeout)
+    std::optional<CommittedSoftPinState> committed_soft_pin_state)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     assert(!accessor.IsPublished());
     const std::string& key = accessor.GetKey();
     const TenantId& tenant_id = accessor.GetTenantId();
-    const auto deadline_to_index = committed_soft_pin_timeout;
+    std::optional<std::chrono::system_clock::time_point> deadline_to_index;
+    if (committed_soft_pin_state) {
+        deadline_to_index = ObjectMetadata::ComputeSoftPinDeadline(
+            committed_soft_pin_state->last_access_time,
+            committed_soft_pin_state->soft_pin_ttl);
+    }
 
     std::vector<Replica::Descriptor> replica_list;
     std::unordered_set<ReplicaID> eligible_replica_ids;
@@ -5374,7 +5402,7 @@ auto MasterService::InsertMetadata(
     }
 
     accessor.Publish(client_id, now, value_length, std::move(replicas),
-                     std::move(committed_soft_pin_timeout),
+                     std::move(committed_soft_pin_state),
                      config.with_hard_pin, config.data_type, group_id,
                      tenant_id, key);
     auto& metadata = accessor.Get();
@@ -5414,8 +5442,7 @@ auto MasterService::AllocateAndInsertMetadata(
     const std::string& group_id,
     const std::chrono::system_clock::time_point& now,
     const ResolvedSoftPinRequest& soft_pin_request,
-    std::optional<std::chrono::system_clock::time_point>
-        committed_soft_pin_timeout,
+    std::optional<CommittedSoftPinState> committed_soft_pin_state,
     bool* dfs_allocation_failed)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     assert(!accessor.IsPublished());
@@ -5439,7 +5466,7 @@ auto MasterService::AllocateAndInsertMetadata(
     auto insert_result = InsertMetadata(
         accessor, client_id, value_length, config, group_id, now,
         soft_pin_request, std::move(allocation_result.value()),
-        pending_quota_charge, std::move(committed_soft_pin_timeout));
+        pending_quota_charge, std::move(committed_soft_pin_state));
     if (!insert_result) {
         ReleaseTenantQuota(accessor.QuotaAccount(), pending_quota_charge);
     }
@@ -6169,8 +6196,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     ReplicateConfig allocation_config = config;
     std::string allocation_group_id = group_id;
     std::string allocation_session_id;
-    std::optional<std::chrono::system_clock::time_point>
-        allocation_committed_soft_pin_timeout;
+    std::optional<CommittedSoftPinState> allocation_committed_soft_pin_state;
     auto admit = [&](bool* dfs_allocation_failed)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
         auto now = std::chrono::system_clock::now();
@@ -6281,11 +6307,15 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     // effectively does not exist — fall through to Case A.
                     if (!metadata.HasReplica(&Replica::fn_is_completed)) {
                         allocation_session_id = metadata.session_id;
-                        allocation_committed_soft_pin_timeout =
-                            metadata.GetCommittedSoftPinTimeout();
-                        if (allocation_committed_soft_pin_timeout &&
-                            *allocation_committed_soft_pin_timeout <= now) {
-                            allocation_committed_soft_pin_timeout.reset();
+                        allocation_committed_soft_pin_state =
+                            metadata.GetCommittedSoftPinState();
+                        if (allocation_committed_soft_pin_state &&
+                            ObjectMetadata::ComputeSoftPinDeadline(
+                                allocation_committed_soft_pin_state
+                                    ->last_access_time,
+                                allocation_committed_soft_pin_state
+                                    ->soft_pin_ttl) <= now) {
+                            allocation_committed_soft_pin_state.reset();
                         }
                         accessor.Erase();
                     } else {
@@ -6306,7 +6336,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 auto result = AllocateAndInsertMetadata(
                     accessor, client_id, slice_length, allocation_config,
                     writer_host_id, allocation_group_id, now, soft_pin_request,
-                    allocation_committed_soft_pin_timeout,
+                    allocation_committed_soft_pin_state,
                     dfs_allocation_failed);
                 if (result) {
                     accessor.Get().session_id = allocation_session_id;
@@ -6431,11 +6461,14 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 allocation_config = config;
                 allocation_config.with_hard_pin =
                     allocation_config.with_hard_pin || metadata.IsHardPinned();
-                allocation_committed_soft_pin_timeout =
-                    metadata.GetCommittedSoftPinTimeout();
-                if (allocation_committed_soft_pin_timeout &&
-                    *allocation_committed_soft_pin_timeout <= now) {
-                    allocation_committed_soft_pin_timeout.reset();
+                allocation_committed_soft_pin_state =
+                    metadata.GetCommittedSoftPinState();
+                if (allocation_committed_soft_pin_state &&
+                    ObjectMetadata::ComputeSoftPinDeadline(
+                        allocation_committed_soft_pin_state->last_access_time,
+                        allocation_committed_soft_pin_state->soft_pin_ttl) <=
+                        now) {
+                    allocation_committed_soft_pin_state.reset();
                 }
 
                 allocation_group_id = metadata.group_id;
@@ -6524,12 +6557,12 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                   soft_pin_request,
                                   std::move(*replacement_replicas),
                                   replacement_pending_quota_charge,
-                                  allocation_committed_soft_pin_timeout)
+                                  allocation_committed_soft_pin_state)
                             : AllocateAndInsertMetadata(
                                   accessor, client_id, slice_length,
                                   allocation_config, writer_host_id,
                                   allocation_group_id, now, soft_pin_request,
-                                  allocation_committed_soft_pin_timeout,
+                                  allocation_committed_soft_pin_state,
                                   dfs_allocation_failed);
                 if (!allocate_result) {
                     if (replacement_replicas.has_value()) {

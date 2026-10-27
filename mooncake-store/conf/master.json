@@ -12,6 +12,7 @@
   "max_kv_soft_pin_ttl": 604800000,
   "allow_evict_soft_pinned_objects": true,
   "enable_soft_pin_ttl_reclaim": false,
+  "enable_nof_soft_pin_access_renewal": false,
   "eviction_ratio": 0.1,
   "eviction_high_watermark_ratio": 1.0,
   "tenant_eviction_high_watermark_ratio": 0.9,
