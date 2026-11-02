@@ -109,9 +109,7 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
                     struct_pack::errc::ok ||
                 op.segment_id == UUID{0, 0} ||
                 op.owner_client_id == UUID{0, 0} || op.segment_name.empty() ||
-                op.transport_endpoint.empty() || op.capacity == 0 ||
-                (op.allocator_type != BufferAllocatorType::CACHELIB &&
-                 op.allocator_type != BufferAllocatorType::OFFSET)) {
+                op.transport_endpoint.empty() || op.capacity == 0) {
                 LOG(ERROR) << "Invalid NoF segment OpLog payload for key "
                            << entry.object_key;
                 return false;

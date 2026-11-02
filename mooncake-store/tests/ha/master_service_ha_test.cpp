@@ -1454,7 +1454,8 @@ TEST_F(MasterServiceHATest, BatchPromotionRestoresNoFAcrossChunks) {
     nof.transport_endpoint = endpoint;
     nof.base = base;
     nof.capacity = segment.capacity;
-    nof.allocator_type = BufferAllocatorType::OFFSET;
+    nof.host_id = "batch-nof-host";
+    nof.rack_id = "batch-nof-rack";
     segment.nof = nof;
 
     auto source = std::make_unique<StandbyMetadataStore>();
@@ -1488,6 +1489,11 @@ TEST_F(MasterServiceHATest, BatchPromotionRestoresNoFAcrossChunks) {
     ASSERT_EQ(owners->size(), 1);
     EXPECT_EQ(owners->front().segment_id, nof.segment_id);
     EXPECT_EQ(owners->front().client_id, nof.owner_client_id);
+    auto restored_segment =
+        MasterServiceTestPeer(service).GetNoFSegmentForTesting(nof.segment_id);
+    ASSERT_TRUE(restored_segment.has_value());
+    EXPECT_EQ(restored_segment->host_id, nof.host_id);
+    EXPECT_EQ(restored_segment->rack_id, nof.rack_id);
     auto usage = service.GetStorageUsageSnapshot();
     EXPECT_EQ(usage.nof.used_bytes, 8192);
     EXPECT_EQ(usage.nof.capacity_bytes, segment.capacity);
@@ -1817,7 +1823,6 @@ TEST_F(MasterServiceHATest, RestoreDroppedNoFReplicasStayDroppedAfterReplay) {
         nof.transport_endpoint = stale_endpoint;
         nof.base = kDefaultSegmentBase;
         nof.capacity = kDefaultSegmentSize;
-        nof.allocator_type = BufferAllocatorType::OFFSET;
         auto bytes = struct_pack::serialize(nof);
         OpLogEntry mount;
         mount.sequence_id = 3;
@@ -2465,6 +2470,52 @@ TEST_F(MasterServiceHATest,
 }
 
 #ifdef USE_NOF
+TEST_F(MasterServiceHATest, NoFMountAndRemountReplayTopologyToStandby) {
+    const std::string cluster_id = "nof_topology_replay";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(
+        MasterServiceConfig::builder()
+            .set_enable_ha(true)
+            .set_enable_oplog(true)
+            .set_cluster_id(cluster_id)
+            .set_oplog_batch_max_entries(1)
+            .set_memory_allocator(BufferAllocatorType::CACHELIB)
+            .build());
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    auto segment =
+        MakeNoFSegment("nof-topology", "nof-topology-endpoint", 0, 4096);
+    segment.host_id = "storage-host";
+    segment.rack_id = "storage-rack";
+    const auto owner = generate_uuid();
+    OpLogBatchStorage storage(cluster_id, *backend);
+    MockMetadataStore metadata;
+    OpLogApplier applier(&metadata, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+    OpLogBatchRecord batch;
+    for (bool remount : {false, true}) {
+        if (remount) {
+            auto retry = segment;
+            retry.host_id = "untrusted-retry-host";
+            retry.rack_id = "untrusted-retry-rack";
+            ASSERT_TRUE(service.ReMountNoFSegment({retry}, owner).has_value());
+        } else {
+            ASSERT_TRUE(service.MountNoFSegment(segment, owner).has_value());
+        }
+        ReadBatchEventually(storage, remount ? 2 : 1, batch);
+        auto poll = reader.PollOnce();
+        ASSERT_EQ(poll.error, ErrorCode::OK);
+        ASSERT_EQ(poll.applied_entries, 1);
+        auto registered =
+            applier.GetSegmentRegistry().GetSegment(segment.te_endpoint);
+        ASSERT_TRUE(registered.has_value());
+        ASSERT_TRUE(registered->nof.has_value());
+        EXPECT_EQ(registered->nof->host_id, segment.host_id);
+        EXPECT_EQ(registered->nof->rack_id, segment.rack_id);
+    }
+}
+
 TEST_F(MasterServiceHATest, NoFMountsCanRunWithSharedMasterStateLock) {
     for (bool remount : {false, true}) {
         SCOPED_TRACE(remount);
@@ -3839,11 +3890,17 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesNoFBufferDescriptor) {
     nof.transport_endpoint = endpoint;
     nof.base = address;
     nof.capacity = segment.capacity;
-    nof.allocator_type = BufferAllocatorType::OFFSET;
+    nof.host_id = "standby-nof-host";
+    nof.rack_id = "standby-nof-rack";
     segment.nof = nof;
 
     ASSERT_TRUE(
         service.RestoreFromStandbySnapshot({object}, 7, {segment}).has_value());
+    auto restored_segment =
+        MasterServiceTestPeer(service).GetNoFSegmentForTesting(nof.segment_id);
+    ASSERT_TRUE(restored_segment.has_value());
+    EXPECT_EQ(restored_segment->host_id, nof.host_id);
+    EXPECT_EQ(restored_segment->rack_id, nof.rack_id);
 
     auto replicas = ReplicaDescriptorsForTesting(service, kDefaultTenant,
                                                  "standby_restore_nof_key");
@@ -3861,6 +3918,38 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesNoFBufferDescriptor) {
     ASSERT_TRUE(public_replicas.has_value());
     ASSERT_EQ(public_replicas->replicas.size(), 1);
     EXPECT_TRUE(public_replicas->replicas.front().is_nof_replica());
+}
+
+TEST_F(MasterServiceHATest, RestoreEmptyNoFUsesOffsetAndPreservesTopology) {
+    MasterService service(
+        MasterServiceConfig::builder()
+            .set_enable_ha(false)
+            .set_memory_allocator(BufferAllocatorType::CACHELIB)
+            .build());
+    StandbySegmentInfo segment;
+    segment.segment_name = "empty-nof-segment";
+    segment.transport_endpoint = "empty-nof-endpoint";
+    segment.capacity = 4096;
+    NoFSegmentOp nof;
+    nof.segment_id = generate_uuid();
+    nof.owner_client_id = generate_uuid();
+    nof.segment_name = segment.segment_name;
+    nof.transport_endpoint = segment.transport_endpoint;
+    nof.capacity = segment.capacity;
+    nof.host_id = "empty-nof-host";
+    nof.rack_id = "empty-nof-rack";
+    segment.nof = nof;
+
+    ASSERT_TRUE(
+        service.RestoreFromStandbySnapshot({}, 7, {segment}).has_value());
+    auto restored =
+        MasterServiceTestPeer(service).GetNoFSegmentForTesting(nof.segment_id);
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->base, 0u);
+    EXPECT_EQ(restored->host_id, nof.host_id);
+    EXPECT_EQ(restored->rack_id, nof.rack_id);
+    EXPECT_EQ(service.GetStorageUsageSnapshot().nof.capacity_bytes,
+              segment.capacity);
 }
 
 TEST_F(MasterServiceHATest, OplogDisabledByDefaultDoesNotCreateWriter) {

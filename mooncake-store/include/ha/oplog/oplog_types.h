@@ -83,10 +83,11 @@ struct NoFSegmentOp {
     std::string transport_endpoint;
     uint64_t base{0};
     uint64_t capacity{0};
-    BufferAllocatorType allocator_type{BufferAllocatorType::CACHELIB};
+    std::string host_id;
+    std::string rack_id;
 
     YLT_REFL(NoFSegmentOp, segment_id, owner_client_id, segment_name,
-             transport_endpoint, base, capacity, allocator_type);
+             transport_endpoint, base, capacity, host_id, rack_id);
 };
 
 struct NoFSegmentUnmountOp {

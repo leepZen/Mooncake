@@ -633,7 +633,8 @@ TEST_F(OpLogApplierTest, NoFSegmentSurvivesBatchSnapshotAndIdentityUnmount) {
     mount.transport_endpoint = "nvmeof-endpoint";
     mount.base = 4 * 1024 * 1024;
     mount.capacity = 8 * 1024 * 1024;
-    mount.allocator_type = BufferAllocatorType::OFFSET;
+    mount.host_id = "storage-host";
+    mount.rack_id = "rack-a";
     auto mount_bytes = struct_pack::serialize(mount);
     ASSERT_TRUE(applier_->ApplyOpLogEntry(
         MakeEntry(1, OpType::NOF_SEGMENT_MOUNT, mount.transport_endpoint,
@@ -649,8 +650,12 @@ TEST_F(OpLogApplierTest, NoFSegmentSurvivesBatchSnapshotAndIdentityUnmount) {
     EXPECT_EQ(decoded->front().nof->owner_client_id, mount.owner_client_id);
     EXPECT_EQ(decoded->front().nof->base, mount.base);
     EXPECT_EQ(decoded->front().nof->capacity, mount.capacity);
+    EXPECT_EQ(decoded->front().nof->host_id, mount.host_id);
+    EXPECT_EQ(decoded->front().nof->rack_id, mount.rack_id);
 
     mount.capacity *= 2;
+    mount.host_id = "updated-storage-host";
+    mount.rack_id = "rack-b";
     auto update_bytes = struct_pack::serialize(mount);
     ASSERT_TRUE(applier_->ApplyOpLogEntry(
         MakeEntry(2, OpType::NOF_SEGMENT_UPDATE, mount.transport_endpoint,
@@ -659,6 +664,9 @@ TEST_F(OpLogApplierTest, NoFSegmentSurvivesBatchSnapshotAndIdentityUnmount) {
         applier_->GetSegmentRegistry().GetSegment(mount.transport_endpoint);
     ASSERT_TRUE(updated.has_value());
     EXPECT_EQ(updated->capacity, mount.capacity);
+    ASSERT_TRUE(updated->nof.has_value());
+    EXPECT_EQ(updated->nof->host_id, mount.host_id);
+    EXPECT_EQ(updated->nof->rack_id, mount.rack_id);
 
     NoFSegmentUnmountOp stale{UUID{9, 9}, mount.transport_endpoint};
     auto stale_bytes = struct_pack::serialize(stale);

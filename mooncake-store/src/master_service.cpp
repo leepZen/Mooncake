@@ -258,7 +258,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
       quota_bytes_(config.quota_bytes),
       enable_multi_tenants_(config.enable_multi_tenants),
       segment_manager_(config.memory_allocator, config.enable_cxl),
-      nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_type_(config.enable_cxl
                                     ? AllocationStrategyType::CXL
@@ -821,7 +820,8 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
         op.transport_endpoint = segment.te_endpoint;
         op.base = segment.base;
         op.capacity = segment.size;
-        op.allocator_type = memory_allocator_type_;
+        op.host_id = segment.host_id;
+        op.rack_id = segment.rack_id;
         auto bytes = struct_pack::serialize(op);
         PersistSegmentOpForHAOrEnqueue(
             "MountNoFSegment", OpType::NOF_SEGMENT_MOUNT, segment.te_endpoint,
@@ -1238,7 +1238,8 @@ auto MasterService::ReMountNoFSegment(const std::vector<NoFSegment>& segments,
             op.transport_endpoint = authoritative.te_endpoint;
             op.base = authoritative.base;
             op.capacity = authoritative.size;
-            op.allocator_type = memory_allocator_type_;
+            op.host_id = authoritative.host_id;
+            op.rack_id = authoritative.rack_id;
             auto bytes = struct_pack::serialize(op);
             PersistSegmentOpForHAOrEnqueue(
                 "ReMountNoFSegment", OpType::NOF_SEGMENT_MOUNT,
@@ -3809,8 +3810,6 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             if (nof.segment_id == UUID{0, 0} ||
                 nof.owner_client_id == UUID{0, 0} || nof.segment_name.empty() ||
                 nof.transport_endpoint.empty() || nof.capacity == 0 ||
-                (nof.allocator_type != BufferAllocatorType::CACHELIB &&
-                 nof.allocator_type != BufferAllocatorType::OFFSET) ||
                 nof.base >
                     std::numeric_limits<uintptr_t>::max() - nof.capacity ||
                 nof.segment_name != seg.segment_name ||
@@ -4344,6 +4343,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         nof_segment.te_endpoint = endpoint;
         nof_segment.base = info.base;
         nof_segment.size = info.capacity;
+        nof_segment.host_id = info.host_id;
+        nof_segment.rack_id = info.rack_id;
         std::shared_ptr<BufferAllocatorBase> allocator;
         std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
         auto& descriptors = nof_descriptors[segment];
@@ -4365,7 +4366,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             buffers = std::move(imported->buffers);
         } else {
             auto created = CreateBufferAllocator(
-                info.allocator_type, info.segment_name, info.base,
+                BufferAllocatorType::OFFSET, info.segment_name, info.base,
                 info.capacity, endpoint, ReplicaType::NOF_SSD);
             if (!created) {
                 rollback_restored_state();
@@ -11874,6 +11875,8 @@ void MasterService::TryMountAddedNoFNamespaces(
         new_segment.size = static_cast<size_t>(capacity);
         new_segment.name = endpoint;
         new_segment.te_endpoint = endpoint;
+        new_segment.host_id = template_snapshot.segment.host_id;
+        new_segment.rack_id = template_snapshot.segment.rack_id;
 
         auto mount_result =
             MountNoFSegment(new_segment, template_snapshot.client_id);

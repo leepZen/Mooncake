@@ -843,18 +843,6 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(
         return ErrorCode::INVALID_PARAMS;
     }
 
-    if (!restored_allocator &&
-        nof_segment_manager_->memory_allocator_ ==
-            BufferAllocatorType::CACHELIB &&
-        (buffer % facebook::cachelib::Slab::kSize ||
-         size % facebook::cachelib::Slab::kSize)) {
-        LOG(ERROR) << "NoF segment mount: buffer=" << buffer
-                   << " or size=" << size << " is not aligned to "
-                   << facebook::cachelib::Slab::kSize
-                   << " as required by Cachelib";
-        return ErrorCode::INVALID_PARAMS;
-    }
-
     auto exist_segment_it =
         nof_segment_manager_->mounted_segments_.find(segment.id);
     if (exist_segment_it != nof_segment_manager_->mounted_segments_.end()) {
@@ -887,7 +875,7 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(
         std::move(restored_allocator);
     if (!allocator) {
         auto created = CreateBufferAllocator(
-            nof_segment_manager_->memory_allocator_, segment.name, buffer, size,
+            BufferAllocatorType::OFFSET, segment.name, buffer, size,
             segment.te_endpoint, ReplicaType::NOF_SSD);
         if (!created) {
             return created.error();
