@@ -798,8 +798,7 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
                << ", error=nof_pool_disabled";
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
-    // Keep the mount visible to Put only after its registry OpLog is queued.
-    std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     LOG(INFO) << "NoF segment mount: "
               << "client_id=" << client_id
               << ", action=mount_segment, segment_name=" << segment.name;
@@ -1210,7 +1209,7 @@ auto MasterService::ReMountNoFSegment(const std::vector<NoFSegment>& segments,
                << ", error=nof_pool_disabled";
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
-    std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     std::vector<MountedNoFSegmentSnapshot> mounted;
     {
         auto access = nof_segment_manager_.getNoFSegmentAccess();
@@ -3254,11 +3253,15 @@ struct MasterService::LegacyRestoreContext {
     const std::vector<StandbyObjectEntry>& objects;
     const std::unordered_map<std::string, const StandbySegmentInfo*>&
         segments_by_alias;
+    const std::unordered_map<std::string, const StandbySegmentInfo*>&
+        nof_segments_by_endpoint;
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>&
         allocators;
     std::unordered_map<std::string, uint64_t>& accounted_bytes;
     size_t& rejected_count;
     size_t& already_existing_count;
+    size_t& dropped_stale_replica_count;
+    size_t& skipped_stale_object_count;
     std::vector<std::pair<TenantId, std::string>>& repair_remove_keys;
     std::vector<std::pair<TenantId, std::string>>& repair_canonical_keys;
     std::vector<std::pair<TenantId, route::ObjectRef>>& installed;
@@ -3414,11 +3417,27 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
         }
         const auto discarded_it = ctx.discarded_replicas.find(owner);
         size_t reliable = 0;
+        bool dropped_stale_nof_replica = false;
         for (size_t desc_idx = 0;
              desc_idx < accepted_entry.entry->metadata.replicas.size();
              ++desc_idx) {
             const auto& desc =
                 accepted_entry.entry->metadata.replicas[desc_idx];
+            if (desc.is_nof_replica() &&
+                !ctx.nof_segments_by_endpoint.contains(
+                    desc.get_nof_descriptor()
+                        .buffer_descriptor.transport_endpoint_)) {
+                LOG(WARNING)
+                    << "RestoreFromStandbySnapshot: dropping replica id="
+                    << desc.id << " on unknown NoF endpoint="
+                    << desc.get_nof_descriptor()
+                           .buffer_descriptor.transport_endpoint_
+                    << ", tenant=" << accepted_entry.tenant_id.value()
+                    << ", key=" << accepted_entry.user_key;
+                ++ctx.dropped_stale_replica_count;
+                dropped_stale_nof_replica = true;
+                continue;
+            }
             if (desc.status == ReplicaStatus::REMOVED ||
                 desc.status == ReplicaStatus::FAILED ||
                 (discarded_it != ctx.discarded_replicas.end() &&
@@ -3428,6 +3447,14 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
             ++reliable;
         }
         if (reliable == 0) {
+            if (dropped_stale_nof_replica &&
+                discarded_it == ctx.discarded_replicas.end()) {
+                ++ctx.skipped_stale_object_count;
+                ctx.repair_remove_keys.emplace_back(accepted_entry.tenant_id,
+                                                    accepted_entry.user_key);
+                accepted_entry.entry = nullptr;
+                continue;
+            }
             // Covers both overlap casualties and objects that arrived with
             // every replica already REMOVED/FAILED: an object with no
             // readable replica is dropped instead of lingering as
@@ -3438,7 +3465,8 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
             ctx.repair_remove_keys.emplace_back(accepted_entry.tenant_id,
                                                 accepted_entry.user_key);
             accepted_entry.entry = nullptr;
-        } else if (discarded_it != ctx.discarded_replicas.end()) {
+        } else if (discarded_it != ctx.discarded_replicas.end() ||
+                   dropped_stale_nof_replica) {
             // Survives with some descriptors discarded: the canonical
             // repair record carries only the survivors.
             ctx.repair_canonical_keys.emplace_back(accepted_entry.tenant_id,
@@ -3503,6 +3531,10 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
             } else if (desc.is_nof_replica()) {
                 const auto& buffer =
                     desc.get_nof_descriptor().buffer_descriptor;
+                if (!ctx.nof_segments_by_endpoint.contains(
+                        buffer.transport_endpoint_)) {
+                    continue;
+                }
                 if (buffer.size_ != standby_meta.size || buffer.size_ == 0) {
                     NoteLegacyStandbyRejection(ctx, entry,
                                                "invalid_nof_descriptor");
@@ -3569,10 +3601,13 @@ tl::expected<size_t, ErrorCode> MasterService::InstallLegacyStandbyObjects(
     // A snapshot whose objects all fail to land is a failed restore, not
     // an empty cluster: reporting success here would let the supervisor
     // serve on zero state. Duplicates of already-served objects are the
-    // exception, since their state is present already. How partial
-    // restores gate serving is N07/N08 scope (#3808), not this stop-gap.
+    // exception, since their state is present already. Objects whose NoF
+    // registrations were lost are cache misses rather than rejected entries.
+    // How partial restores gate serving is N07/N08 scope (#3808), not this
+    // stop-gap.
     if (!ctx.objects.empty() && restored_count == 0 &&
-        ctx.already_existing_count < ctx.objects.size()) {
+        ctx.already_existing_count + ctx.skipped_stale_object_count <
+            ctx.objects.size()) {
         LOG(ERROR) << "RestoreFromStandbySnapshot: every standby object "
                    << "was rejected, objects=" << ctx.objects.size()
                    << ", rejected=" << ctx.rejected_count;
@@ -3873,10 +3908,10 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     // Objects skipped because the live index already holds them are not
     // losses: their state is present, just not from this snapshot.
     size_t already_existing_count = 0;
-    // Conflict-derived discards become durable repair records after the index
-    // installs, so a later promotion cannot replay them: full drops as
-    // key-level REMOVE, partial discards as a canonical PUT_END carrying only
-    // the survivors.
+    // Conflict-derived and unregistered NoF discards become durable repair
+    // records after the index installs, so a later promotion cannot replay
+    // them: full drops as key-level REMOVE, partial discards as a canonical
+    // PUT_END carrying only the survivors.
     std::vector<std::pair<TenantId, std::string>> repair_remove_keys;
     std::vector<std::pair<TenantId, std::string>> repair_canonical_keys;
     // The publications this call installed, so a failed restore can roll its
@@ -3913,6 +3948,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             std::vector<Replica> replicas;
             replicas.reserve(standby_meta.replicas.size());
             bool dropped_stale_replica = false;
+            bool dropped_stale_nof_replica = false;
 
             for (const auto& desc : standby_meta.replicas) {
                 if (desc.is_memory_replica()) {
@@ -4001,7 +4037,19 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                     auto segment_it = nof_segments_by_endpoint.find(
                         buffer.transport_endpoint_);
                     if (segment_it == nof_segments_by_endpoint.end()) {
-                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                        // A Put can reach the OpLog before its segment mount.
+                        // Missing registrations turn these replicas into cache
+                        // misses instead of failing the whole promotion.
+                        LOG(WARNING)
+                            << "RestoreFromStandbySnapshot: dropping replica "
+                            << "id=" << desc.id << " on unknown NoF endpoint="
+                            << buffer.transport_endpoint_
+                            << ", tenant=" << tenant_id.value()
+                            << ", key=" << user_key;
+                        ++dropped_stale_replica_count;
+                        dropped_stale_replica = true;
+                        dropped_stale_nof_replica = true;
+                        continue;
                     }
                     const auto* segment = segment_it->second;
                     const auto& nof = *segment->nof;
@@ -4078,12 +4126,18 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                 }
             }
             if (replicas.empty() && dropped_stale_replica) {
+                if (dropped_stale_nof_replica) {
+                    repair_remove_keys.emplace_back(tenant_id, user_key);
+                }
                 LOG(WARNING)
                     << "RestoreFromStandbySnapshot: skipping object with no "
                     << "surviving replicas, tenant=" << tenant_id.value()
                     << ", key=" << user_key;
                 ++chunk_skipped_objects;
                 continue;
+            }
+            if (dropped_stale_nof_replica) {
+                repair_canonical_keys.emplace_back(tenant_id, user_key);
             }
             prepared.push_back({&entry, std::move(tenant_id),
                                 std::move(user_key), std::move(replicas)});
@@ -4116,11 +4170,19 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
 
     if (legacy_objects) {
         LegacyRestoreContext legacy_ctx{
-            *legacy_objects,     memory_segments_by_alias,
-            restored_allocators, restored_accounted_memory_bytes,
-            rejected_count,      already_existing_count,
-            repair_remove_keys,  repair_canonical_keys,
-            installed,           new_known_owner_records};
+            *legacy_objects,
+            memory_segments_by_alias,
+            nof_segments_by_endpoint,
+            restored_allocators,
+            restored_accounted_memory_bytes,
+            rejected_count,
+            already_existing_count,
+            dropped_stale_replica_count,
+            skipped_stale_object_count,
+            repair_remove_keys,
+            repair_canonical_keys,
+            installed,
+            new_known_owner_records};
         if (auto r = ValidateLegacyStandbyEntries(legacy_ctx); !r) {
             return tl::make_unexpected(r.error());
         }
@@ -4358,7 +4420,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Durable repair for conflict-derived discards: a later promotion must
+    // Durable repair for discarded replicas: a later promotion must
     // not replay what this one dropped. The whole repair set goes out as one
     // indivisible batch record (REMOVE for full drops, canonical PUT_END
     // carrying only the survivors for partial ones), and the restore fails
@@ -4373,7 +4435,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     // unrepaired, so the restore fails explicitly instead.
     if ((!repair_remove_keys.empty() || !repair_canonical_keys.empty()) &&
         enable_oplog_ && !ordered_oplog_writer_) {
-        LOG(ERROR) << "RestoreFromStandbySnapshot: conflict discards need "
+        LOG(ERROR) << "RestoreFromStandbySnapshot: discarded replicas need "
                       "durable repair but no OpLog writer is available; "
                       "failing the restore";
         rollback_restored_state();
