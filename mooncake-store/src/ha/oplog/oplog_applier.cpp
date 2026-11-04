@@ -114,6 +114,15 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         case OpType::WEIGHT_LEASE_DELETE:
             applied = ApplyWeightLeaseDelete(entry);
             break;
+        case OpType::NOF_SEGMENT_MOUNT:
+            applied = ApplyNoFSegmentMount(entry);
+            break;
+        case OpType::NOF_SEGMENT_UNMOUNT:
+            applied = ApplyNoFSegmentUnmount(entry);
+            break;
+        case OpType::NOF_SEGMENT_UPDATE:
+            applied = ApplyNoFSegmentUpdate(entry);
+            break;
         default:
             LOG(ERROR) << "OpLogApplier: unsupported op_type="
                        << static_cast<int>(entry.op_type)
@@ -460,6 +469,45 @@ void OpLogApplier::ApplySegmentUpdate(const OpLogEntry& entry) {
     info.is_memory_segment = op.is_memory_segment;
     info.file_path = op.file_path;
     segment_registry_.OnSegmentUpdate(info);
+}
+
+bool OpLogApplier::ApplyNoFSegmentMount(const OpLogEntry& entry) {
+    NoFSegmentOp op;
+    if (struct_pack::deserialize_to(op, entry.payload) !=
+            struct_pack::errc::ok ||
+        op.segment_id == UUID{0, 0} || op.owner_client_id == UUID{0, 0} ||
+        op.segment_name.empty() || op.transport_endpoint.empty() ||
+        op.capacity == 0) {
+        LOG(ERROR) << "Invalid NoF segment OpLog payload for key "
+                   << entry.object_key;
+        return false;
+    }
+    StandbySegmentInfo info;
+    info.segment_name = op.segment_name;
+    info.transport_endpoint = op.transport_endpoint;
+    info.capacity = op.capacity;
+    info.nof = std::move(op);
+    segment_registry_.OnSegmentMount(info);
+    return true;
+}
+
+bool OpLogApplier::ApplyNoFSegmentUnmount(const OpLogEntry& entry) {
+    NoFSegmentUnmountOp op;
+    if (struct_pack::deserialize_to(op, entry.payload) !=
+        struct_pack::errc::ok) {
+        LOG(ERROR) << "Invalid NoF unmount OpLog payload for key "
+                   << entry.object_key;
+        return false;
+    }
+    auto mounted = segment_registry_.GetSegment(op.transport_endpoint);
+    if (mounted && mounted->nof && mounted->nof->segment_id == op.segment_id) {
+        segment_registry_.OnSegmentUnmount(op.transport_endpoint);
+    }
+    return true;
+}
+
+bool OpLogApplier::ApplyNoFSegmentUpdate(const OpLogEntry& entry) {
+    return ApplyNoFSegmentMount(entry);
 }
 
 }  // namespace mooncake

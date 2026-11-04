@@ -89,6 +89,10 @@ class OpLogApplier {
     bool ApplyWeightLeaseUpsert(const OpLogEntry& entry);
     bool ApplyWeightLeaseDelete(const OpLogEntry& entry);
 
+    bool ApplyNoFSegmentMount(const OpLogEntry& entry);
+    bool ApplyNoFSegmentUnmount(const OpLogEntry& entry);
+    bool ApplyNoFSegmentUpdate(const OpLogEntry& entry);
+
     MetadataStore* metadata_store_;
 
     std::string cluster_id_;

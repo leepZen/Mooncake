@@ -520,9 +520,11 @@ struct NoFSegment {
     size_t size{0};
     // TE p2p endpoint (ip:port) for transport-only addressing
     std::string te_endpoint{};
+    std::string host_id{};
+    std::string rack_id{};
     NoFSegment() = default;
 };
-YLT_REFL(NoFSegment, id, name, base, size, te_endpoint);
+YLT_REFL(NoFSegment, id, name, base, size, te_endpoint, host_id, rack_id);
 
 /**
  * @brief Client status from the master's perspective

@@ -58,6 +58,8 @@ inline std::ostream& operator<<(
        << ", segment.base=" << snapshot.segment.base
        << ", segment.size=" << snapshot.segment.size
        << ", segment.te_endpoint=" << snapshot.segment.te_endpoint
+       << ", segment.host_id=" << snapshot.segment.host_id
+       << ", segment.rack_id=" << snapshot.segment.rack_id
        << ", status=" << snapshot.status << "}";
     return os;
 }
@@ -243,7 +245,9 @@ class ScopedNoFSegmentAccess {
     /**
      * @brief Mount a segment
      */
-    ErrorCode MountSegment(const NoFSegment& segment, const UUID& client_id);
+    ErrorCode MountSegment(
+        const NoFSegment& segment, const UUID& client_id,
+        std::shared_ptr<BufferAllocatorBase> restored_allocator = nullptr);
 
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the
@@ -434,13 +438,7 @@ class SegmentManager {
 
 class NoFSegmentManager {
    public:
-    /**
-     * @brief Constructor for SegmentManager
-     * @param memory_allocator Type of buffer allocator to use for new segments
-     */
-    explicit NoFSegmentManager(
-        BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB)
-        : memory_allocator_(memory_allocator) {}
+    NoFSegmentManager() = default;
 
     /**
      * @brief Get RAII-style access to segment management operations
@@ -507,8 +505,6 @@ class NoFSegmentManager {
         std::make_shared<StorageUsageTracker>();
     mutable std::shared_mutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
-    const BufferAllocatorType
-        memory_allocator_;  // Type of buffer allocator to use
     // allocator_manager_ only contains allocators whose segment status is OK.
     AllocatorManager allocator_manager_;
     std::unordered_map<UUID, MountedNoFSegment, boost::hash<UUID>>
