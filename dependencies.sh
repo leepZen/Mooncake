@@ -468,9 +468,9 @@ if [ "$INSTALL_SPDK" = true ]; then
     check_success "Failed to change to SPDK directory"
 
     # Checkout specific version
-    echo "Checking out SPDK version v23.01.1..."
-    git checkout v23.01.1
-    check_success "Failed to checkout SPDK version v23.01.1"
+    echo "Checking out SPDK version v26.01..."
+    git checkout v26.01
+    check_success "Failed to checkout SPDK version v26.01"
 
     # Initialize submodules
     echo "Initializing SPDK submodules..."
@@ -482,7 +482,9 @@ if [ "$INSTALL_SPDK" = true ]; then
     ./scripts/pkgdep.sh --rdma
     check_success "Failed to install SPDK RDMA dependencies"
 
-    # DPDK bundled with SPDK v23.01.1 does not recognize HiSilicon part 0xd06.
+    # DPDK bundled with SPDK v26.01 recognizes HiSilicon part 0xd06, but its
+    # native hip12 target needs recent compiler support. Keep the portable
+    # generic fallback for this CPU.
     # Keep explicit platform and cross-compilation settings supplied by the user.
     case "$(uname -m)" in
         aarch64|arm64)
@@ -539,7 +541,7 @@ echo -e "  ${GREEN}✓${NC} System packages"
 echo -e "  ${GREEN}✓${NC} Git submodules"
 echo -e "  ${GREEN}✓${NC} Go $GOVER"
 if [ "$INSTALL_SPDK" = true ]; then
-    echo -e "  ${GREEN}✓${NC} SPDK (v23.01.1)"
+    echo -e "  ${GREEN}✓${NC} SPDK (v26.01)"
 fi
 echo
 echo -e "You can now build and run Mooncake."

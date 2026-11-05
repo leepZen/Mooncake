@@ -192,7 +192,10 @@ class SpdkEnvGuard {
                                    &orig_cpuset) == 0;
 #endif
 
-        struct spdk_env_opts opts;
+        struct spdk_env_opts opts {};
+#ifdef HAVE_SPDK_ENV_OPTS_SIZE
+        opts.opts_size = sizeof(opts);
+#endif
         spdk_env_opts_init(&opts);
         opts.name = "mooncake";
         // Containers without physical-address access (restricted

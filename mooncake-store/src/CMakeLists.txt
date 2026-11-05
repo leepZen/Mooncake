@@ -383,65 +383,24 @@ if(USE_NOF)
         "`sudo bash dependencies.sh --with-spdk`, or set -DSPDK_ISA_L_LIB_DIR.")
   endif()
 
+  # Resolve the installed dependency graph, including SPDK 26.01's RDMA
+  # provider and keyring libraries and the bundled DPDK libraries.
+  find_package(PkgConfig REQUIRED)
+  set(SPDK_PKG_CONFIG_PATH_SAVE "$ENV{PKG_CONFIG_PATH}")
+  set(ENV{PKG_CONFIG_PATH}
+      "${SPDK_LIB_DIR}/pkgconfig:${DPDK_LIB_DIR}/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+  pkg_check_modules(SPDK REQUIRED spdk_nvme spdk_sock_posix spdk_env_dpdk)
+  pkg_check_modules(SPDK_SYSLIBS REQUIRED spdk_syslibs)
+  set(ENV{PKG_CONFIG_PATH} "${SPDK_PKG_CONFIG_PATH_SAVE}")
+  unset(SPDK_PKG_CONFIG_PATH_SAVE)
+
+  # Keep transport and DPDK registration constructors from static archives.
   set(SPDK_STATIC_LIBS
       -Wl,--whole-archive
-      ${SPDK_LIB_DIR}/libspdk_event.a
-      ${SPDK_LIB_DIR}/libspdk_rdma.a
-      ${SPDK_LIB_DIR}/libspdk_nvme.a
-      ${SPDK_LIB_DIR}/libspdk_sock_posix.a
+      ${SPDK_STATIC_LDFLAGS}
       -Wl,--no-whole-archive
-      ${SPDK_LIB_DIR}/libspdk_vfio_user.a
-      ${SPDK_LIB_DIR}/libspdk_dma.a
-      ${SPDK_LIB_DIR}/libspdk_init.a
-      ${SPDK_LIB_DIR}/libspdk_env_dpdk.a
-      ${SPDK_LIB_DIR}/libspdk_log.a
-      ${SPDK_LIB_DIR}/libspdk_util.a
-      ${SPDK_LIB_DIR}/libspdk_blob.a
-      ${SPDK_LIB_DIR}/libspdk_blobfs.a
-      ${SPDK_LIB_DIR}/libspdk_bdev.a
-      ${SPDK_LIB_DIR}/libspdk_conf.a
-      ${SPDK_LIB_DIR}/libspdk_json.a
-      ${SPDK_LIB_DIR}/libspdk_jsonrpc.a
-      ${SPDK_LIB_DIR}/libspdk_sock.a
-      ${SPDK_LIB_DIR}/libspdk_thread.a
-      ${SPDK_LIB_DIR}/libspdk_trace.a
-      ${SPDK_LIB_DIR}/libspdk_vmd.a
-      ${SPDK_LIB_DIR}/libspdk_rpc.a
-      ${DPDK_LIB_DIR}/librte_eal.a
-      ${DPDK_LIB_DIR}/librte_mempool.a
-      ${DPDK_LIB_DIR}/librte_ring.a
-      ${DPDK_LIB_DIR}/librte_bus_pci.a
-      ${DPDK_LIB_DIR}/librte_pci.a
-      ${DPDK_LIB_DIR}/librte_timer.a
-      ${DPDK_LIB_DIR}/librte_telemetry.a
-      ${DPDK_LIB_DIR}/librte_kvargs.a
-      ${DPDK_LIB_DIR}/librte_mbuf.a
-      -Wl,--whole-archive
-      ${DPDK_LIB_DIR}/librte_mempool_ring.a
-      -Wl,--no-whole-archive
-      ${DPDK_LIB_DIR}/librte_power.a
-      ${DPDK_LIB_DIR}/librte_ethdev.a
-      ${DPDK_LIB_DIR}/librte_net.a
-      ${DPDK_LIB_DIR}/librte_vhost.a
-      ${DPDK_LIB_DIR}/librte_cryptodev.a
-      ${DPDK_LIB_DIR}/librte_hash.a
-      ${DPDK_LIB_DIR}/librte_rcu.a
-      pthread
-      dl
-      numa
-      rt
-      m
-      uuid
-      crypto
-      aio
-      z
       -L${SPDK_ISA_L_LIB_DIR}
-      isal
-      elf
-      ibverbs
-      rdmacm
-      ssl
-      bsd)
+      ${SPDK_SYSLIBS_STATIC_LDFLAGS})
 
   # ---------------------------------------------------------------------------
   # SPDK-backed NoF initiator implementation, linked PRIVATE so SPDK/DPDK
@@ -452,7 +411,8 @@ if(USE_NOF)
     mooncake_nof_spdk
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SPDK_INCLUDE_DIR}
-            ${DPDK_INCLUDE_DIR})
+            ${DPDK_INCLUDE_DIR} ${SPDK_INCLUDE_DIRS})
+  target_compile_options(mooncake_nof_spdk PRIVATE ${SPDK_CFLAGS_OTHER})
   target_link_libraries(mooncake_nof_spdk
                         PRIVATE ${SPDK_STATIC_LIBS} glog::glog
                                 mooncake_nof_core yalantinglibs::yalantinglibs)
@@ -463,13 +423,21 @@ if(USE_NOF)
   # links; (void)&spdk_mem_register only needs the declaration to exist.
   set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
   include(CheckCXXSourceCompiles)
-  set(CMAKE_REQUIRED_INCLUDES ${SPDK_INCLUDE_DIR})
+  set(CMAKE_REQUIRED_INCLUDES ${SPDK_INCLUDE_DIR} ${SPDK_INCLUDE_DIRS})
   check_cxx_source_compiles(
     "#include <spdk/env.h>
      int main() { (void)&spdk_mem_register; return 0; }"
     HAVE_SPDK_MEM_REGISTER)
+  check_cxx_source_compiles(
+    "#include <spdk/env.h>
+     int main() { spdk_env_opts opts{}; opts.opts_size = sizeof(opts); return 0; }"
+    HAVE_SPDK_ENV_OPTS_SIZE)
   unset(CMAKE_REQUIRED_INCLUDES)
   unset(CMAKE_TRY_COMPILE_TARGET_TYPE)
+  if(HAVE_SPDK_ENV_OPTS_SIZE)
+    target_compile_definitions(mooncake_nof_spdk
+                               PRIVATE HAVE_SPDK_ENV_OPTS_SIZE=1)
+  endif()
   if(HAVE_SPDK_MEM_REGISTER)
     target_compile_definitions(mooncake_nof_spdk
                                PRIVATE HAVE_SPDK_MEM_REGISTER=1)
