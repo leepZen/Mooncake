@@ -444,6 +444,27 @@ fi
 if [ "$INSTALL_SPDK" = true ]; then
     print_section "Installing SPDK"
 
+    # SPDK 26.01 uses uv to install its Python tools during make install.
+    export PATH="/usr/local/bin:$PATH"
+    if ! command -v uv >/dev/null 2>&1; then
+        echo "Installing uv for SPDK Python tools..."
+        spdk_uv_installer=$(mktemp)
+        check_success "Failed to create a temporary file for the uv installer"
+        if ! wget --timeout=30 --tries=2 -O "$spdk_uv_installer" \
+            https://astral.sh/uv/install.sh; then
+            rm -f "$spdk_uv_installer"
+            print_error "Failed to download the uv installer"
+        fi
+        if ! env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 \
+            sh "$spdk_uv_installer"; then
+            rm -f "$spdk_uv_installer"
+            print_error "Failed to install uv for SPDK Python tools"
+        fi
+        rm -f "$spdk_uv_installer"
+    fi
+    uv --version
+    check_success "uv must be available to install SPDK Python tools"
+
     if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
         apt-get install -y libelf-dev
         check_success "Failed to install NoF dependencies"
