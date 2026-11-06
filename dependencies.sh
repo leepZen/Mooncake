@@ -175,6 +175,7 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
                      libunwind-dev \
                      libnuma-dev \
                      libpython3-dev \
+                     python3-pip \
                      libboost-all-dev \
                      libssl-dev \
                      libgrpc-dev \
@@ -229,6 +230,7 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      libunwind-devel \
                      numactl-devel \
                      python3-devel \
+                     python3-pip \
                      boost1.78-devel \
                      openssl-devel \
                      protobuf-devel \
@@ -270,6 +272,7 @@ elif [ "$OS" = "kylin" ]; then
                      libunwind-devel \
                      numactl-devel \
                      python3-devel \
+                     python3-pip \
                      boost-devel \
                      openssl-devel \
                      protobuf-devel \
@@ -448,19 +451,8 @@ if [ "$INSTALL_SPDK" = true ]; then
     export PATH="/usr/local/bin:$PATH"
     if ! command -v uv >/dev/null 2>&1; then
         echo "Installing uv for SPDK Python tools..."
-        spdk_uv_installer=$(mktemp)
-        check_success "Failed to create a temporary file for the uv installer"
-        if ! wget --timeout=30 --tries=2 -O "$spdk_uv_installer" \
-            https://astral.sh/uv/install.sh; then
-            rm -f "$spdk_uv_installer"
-            print_error "Failed to download the uv installer"
-        fi
-        if ! env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 \
-            sh "$spdk_uv_installer"; then
-            rm -f "$spdk_uv_installer"
-            print_error "Failed to install uv for SPDK Python tools"
-        fi
-        rm -f "$spdk_uv_installer"
+        python3 -m pip install uv
+        check_success "Failed to install uv with python3 -m pip"
     fi
     uv --version
     check_success "uv must be available to install SPDK Python tools"
