@@ -377,6 +377,13 @@ MasterMetricManager::MasterMetricManager()
                              "Total number of keys evicted in nof"),
       nof_evicted_size_("master_evicted_size_bytes_nof",
                         "Total bytes of evicted objects in nof"),
+      // soft-pin TTL reclaim
+      soft_pin_reclaimed_key_count_(
+          "master_soft_pin_reclaimed_keys_total",
+          "Total number of NoF-only keys reclaimed after soft pin TTL expiry"),
+      soft_pin_reclaimed_bytes_(
+          "master_soft_pin_reclaimed_bytes_total",
+          "Total bytes of NoF replicas reclaimed after soft pin TTL expiry"),
 
       // Initialize Discarded Replicas Counters
       put_start_discard_cnt_("master_put_start_discard_cnt",
@@ -1743,6 +1750,12 @@ void MasterMetricManager::inc_nof_eviction_fail() {
     nof_eviction_attempts_.inc();
 }
 
+void MasterMetricManager::inc_soft_pin_reclaimed(int64_t key_count,
+                                                int64_t size) {
+    soft_pin_reclaimed_key_count_.inc(key_count);
+    soft_pin_reclaimed_bytes_.inc(size);
+}
+
 int64_t MasterMetricManager::get_eviction_success() {
     return eviction_success_.value();
 }
@@ -1789,6 +1802,14 @@ int64_t MasterMetricManager::get_nof_evicted_key_count() {
 
 int64_t MasterMetricManager::get_nof_evicted_size() {
     return nof_evicted_size_.value();
+}
+
+int64_t MasterMetricManager::get_soft_pin_reclaimed_key_count() {
+    return soft_pin_reclaimed_key_count_.value();
+}
+
+int64_t MasterMetricManager::get_soft_pin_reclaimed_bytes() {
+    return soft_pin_reclaimed_bytes_.value();
 }
 
 // PutStart Discard Metrics Getters
@@ -2194,6 +2215,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(nof_eviction_attempts_);
     serialize_metric(nof_evicted_key_count_);
     serialize_metric(nof_evicted_size_);
+    serialize_metric(soft_pin_reclaimed_key_count_);
+    serialize_metric(soft_pin_reclaimed_bytes_);
 
     // Serialize PutStart Discard Metrics
     serialize_metric(put_start_discard_cnt_);
@@ -2863,6 +2886,10 @@ std::string MasterMetricManager::get_summary_string(
        << nof_eviction_attempts << ", "
        << "keys=" << nof_evicted_key_count << ", "
        << "size=" << byte_size_to_string(nof_evicted_size);
+    // soft-pin TTL reclaim
+    ss << " | SoftPin Reclaim: "
+       << "keys=" << soft_pin_reclaimed_key_count_.value() << ", "
+       << "size=" << byte_size_to_string(soft_pin_reclaimed_bytes_.value());
 
     // Discard summary
     ss << " | Discard: "

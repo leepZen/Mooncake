@@ -322,6 +322,10 @@ class MasterMetricManager {
     int64_t get_nof_eviction_attempts();
     int64_t get_nof_evicted_key_count();
     int64_t get_nof_evicted_size();
+    // soft-pin TTL reclaim metrics
+    void inc_soft_pin_reclaimed(int64_t key_count, int64_t size);
+    int64_t get_soft_pin_reclaimed_key_count();
+    int64_t get_soft_pin_reclaimed_bytes();
 
     // PutStart Discard Metrics
     void inc_put_start_discard_cnt(int64_t count, int64_t size);
@@ -746,6 +750,9 @@ class MasterMetricManager {
     ylt::metric::counter_t nof_eviction_attempts_;
     ylt::metric::counter_t nof_evicted_key_count_;
     ylt::metric::counter_t nof_evicted_size_;
+    // soft-pin TTL reclaim metrics
+    ylt::metric::counter_t soft_pin_reclaimed_key_count_;
+    ylt::metric::counter_t soft_pin_reclaimed_bytes_;
 
     // PutStart Discard Metrics
     ylt::metric::counter_t put_start_discard_cnt_;
