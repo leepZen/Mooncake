@@ -383,13 +383,18 @@ if(USE_NOF)
         "`sudo bash dependencies.sh --with-spdk`, or set -DSPDK_ISA_L_LIB_DIR.")
   endif()
 
+  # SPDK 26.01 splits RDMA into provider/utils and adds the NVMe keyring
+  # dependency. Group the archives to resolve their transitive dependencies.
   set(SPDK_STATIC_LIBS
+      -Wl,--start-group
       -Wl,--whole-archive
       ${SPDK_LIB_DIR}/libspdk_event.a
-      ${SPDK_LIB_DIR}/libspdk_rdma.a
+      ${SPDK_LIB_DIR}/libspdk_rdma_provider.a
+      ${SPDK_LIB_DIR}/libspdk_rdma_utils.a
       ${SPDK_LIB_DIR}/libspdk_nvme.a
       ${SPDK_LIB_DIR}/libspdk_sock_posix.a
       -Wl,--no-whole-archive
+      ${SPDK_LIB_DIR}/libspdk_keyring.a
       ${SPDK_LIB_DIR}/libspdk_vfio_user.a
       ${SPDK_LIB_DIR}/libspdk_dma.a
       ${SPDK_LIB_DIR}/libspdk_init.a
@@ -397,8 +402,9 @@ if(USE_NOF)
       ${SPDK_LIB_DIR}/libspdk_log.a
       ${SPDK_LIB_DIR}/libspdk_util.a
       ${SPDK_LIB_DIR}/libspdk_blob.a
-      ${SPDK_LIB_DIR}/libspdk_blobfs.a
       ${SPDK_LIB_DIR}/libspdk_bdev.a
+      ${SPDK_LIB_DIR}/libspdk_accel.a
+      ${SPDK_LIB_DIR}/libspdk_notify.a
       ${SPDK_LIB_DIR}/libspdk_conf.a
       ${SPDK_LIB_DIR}/libspdk_json.a
       ${SPDK_LIB_DIR}/libspdk_jsonrpc.a
@@ -415,6 +421,8 @@ if(USE_NOF)
       ${DPDK_LIB_DIR}/librte_timer.a
       ${DPDK_LIB_DIR}/librte_telemetry.a
       ${DPDK_LIB_DIR}/librte_kvargs.a
+      ${DPDK_LIB_DIR}/librte_log.a
+      ${DPDK_LIB_DIR}/librte_argparse.a
       ${DPDK_LIB_DIR}/librte_mbuf.a
       -Wl,--whole-archive
       ${DPDK_LIB_DIR}/librte_mempool_ring.a
@@ -422,10 +430,13 @@ if(USE_NOF)
       ${DPDK_LIB_DIR}/librte_power.a
       ${DPDK_LIB_DIR}/librte_ethdev.a
       ${DPDK_LIB_DIR}/librte_net.a
+      ${DPDK_LIB_DIR}/librte_meter.a
       ${DPDK_LIB_DIR}/librte_vhost.a
       ${DPDK_LIB_DIR}/librte_cryptodev.a
+      ${DPDK_LIB_DIR}/librte_dmadev.a
       ${DPDK_LIB_DIR}/librte_hash.a
       ${DPDK_LIB_DIR}/librte_rcu.a
+      -Wl,--end-group
       pthread
       dl
       numa
@@ -440,6 +451,7 @@ if(USE_NOF)
       elf
       ibverbs
       rdmacm
+      fuse3
       ssl
       bsd)
 
