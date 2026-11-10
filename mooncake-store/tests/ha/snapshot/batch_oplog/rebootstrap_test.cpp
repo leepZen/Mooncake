@@ -1,5 +1,6 @@
 #include "ha_metric_manager.h"
 #include "hot_standby_service.h"
+#include "ha/prepared_standby_state.h"
 
 #include <gtest/gtest.h>
 #include <unistd.h>
@@ -89,6 +90,8 @@ class RebootstrapTest : public ::testing::Test {
         config.enable_verification = false;
         config.oplog_poll_interval_ms = 1;
         service_ = std::make_unique<HotStandbyService>(config);
+        service_->SetPreparationConfig(
+            MasterServiceConfig::builder().set_enable_ha(false).build());
         service_->SetCatchUpBatchKvBackendForTesting(backend_);
         service_->SetBatchOpLogSnapshotProvider(
             std::make_unique<BatchOpLogSnapshotProvider>(
@@ -204,6 +207,8 @@ class RebootstrapTest : public ::testing::Test {
         ASSERT_TRUE(handoff);
         EXPECT_EQ(4u, handoff->applied_cursor.batch_id);
         EXPECT_EQ(4u, handoff->applied_cursor.last_seq);
+        ASSERT_TRUE(handoff->prepared_state);
+        EXPECT_TRUE(handoff->prepared_state->ReadyAt(handoff->applied_cursor));
         EXPECT_EQ(1u, handoff->metadata_store->GetKeyCount());
         EXPECT_TRUE(handoff->metadata_store->Exists("new"));
         ASSERT_EQ(1u, handoff->segments.size());

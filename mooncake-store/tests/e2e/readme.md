@@ -237,3 +237,39 @@ A 30-second soak is only a smoke test; report the actual measured duration.
 maintenance status before/after compact and defrag, `soak-result.json`, and
 `audits.log`. Process logs and acknowledgement manifests are in `logs/` and
 `workload/`. Batch-specific helpers are in `tests/ha/snapshot/batch_oplog/`.
+
+## Prepared standby promotion
+
+OpLog-following standby controllers prepare a dormant `MasterService` while
+loading the baseline and maintain it at complete durable batch boundaries.
+Promotion adopts this same runtime after fencing and final catch-up. Binding
+the term does not reconstruct objects or rebuild their quota/group references.
+Primary background workers and RPC admission remain disabled until activation.
+If activation has not happened, a failed term retains the descriptor baseline
+and the prepared runtime for the next replay attempt. A malformed replay or a
+failed preparation cannot pass the readiness gate.
+
+Run the focused tests without an external HA backend:
+
+```bash
+ctest --test-dir /path/to/build --output-on-failure \
+  -R 'prepared_standby_state_test|batch_oplog_snapshot_promotion_test|batch_oplog_snapshot_rebootstrap_test|standby_metadata_store_test|oplog_applier_test'
+```
+
+`batch_oplog_promotion_bench --prepared=true --objects=100000 --tail_objects=1`
+reports baseline preparation, tail preparation, term binding and activation
+separately, together with reconstructed object count and peak RSS. Repeat with
+larger object counts while holding the tail constant. Use `--prepared=false` to
+measure the legacy restore path. This local benchmark excludes distributed
+fencing, durable repairs and RPC readiness publication.
+
+The descriptor baseline and prepared runtime coexist while following, so this
+trades standby memory and replay CPU for shorter takeover. Ordinary memory
+segments remain unreadable until their clients remount; the prepared reverse
+index limits recovery to objects referencing those segments. NoF allocators
+are prepared before takeover, but a changed NoF segment currently rebuilds its
+allocator from that segment's members. Weight metadata is refreshed as a
+snapshot when its revision changes. Thus final catch-up still depends on the
+tail and its affected segments/weights; only an already caught-up, repair-free
+runtime has an object-count-independent binding/activation path. The real-etcd
+cluster smoke above remains necessary to validate distributed failover.

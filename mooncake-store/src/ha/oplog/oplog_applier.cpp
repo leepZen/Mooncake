@@ -85,7 +85,7 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
     bool applied = true;
     switch (entry.op_type) {
         case OpType::PUT_END:
-            ApplyPutEnd(entry);
+            applied = ApplyPutEnd(entry);
             break;
         case OpType::PUT_REVOKE:
             ApplyPutRevoke(entry);
@@ -94,13 +94,13 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
             ApplyRemove(entry);
             break;
         case OpType::SEGMENT_MOUNT:
-            ApplySegmentMount(entry);
+            applied = ApplySegmentMount(entry);
             break;
         case OpType::SEGMENT_UNMOUNT:
-            ApplySegmentUnmount(entry);
+            applied = ApplySegmentUnmount(entry);
             break;
         case OpType::SEGMENT_UPDATE:
-            ApplySegmentUpdate(entry);
+            applied = ApplySegmentUpdate(entry);
             break;
         case OpType::WEIGHT_METADATA_UPSERT:
             applied = ApplyWeightMetadataUpsert(entry);
@@ -166,55 +166,22 @@ void OpLogApplier::Recover(uint64_t last_applied_sequence_id) {
               << expected_sequence_id_.load();
 }
 
-void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
-    // Payload contains serialized metadata (replicas, size, etc.) in JSON
-    // format. Deserialize the payload immediately and store structured
-    // metadata. This allows Standby to serve requests immediately after
-    // promotion.
-
+bool OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
+    // An empty legacy payload is still supported; a corrupt nonempty payload
+    // must never advance the cursor or replace a valid object with emptiness.
     if (entry.payload.empty()) {
-        // No payload - create empty metadata (legacy compatibility)
-        LOG(WARNING) << "OpLogApplier: PUT_END without payload, key="
-                     << entry.object_key
-                     << ", sequence_id=" << entry.sequence_id;
-        StandbyObjectMetadata empty_metadata;
-        if (!metadata_store_->PutMetadata(entry.tenant_id, entry.object_key,
-                                          empty_metadata)) {
-            LOG(ERROR) << "OpLogApplier: failed to PutMetadata key="
-                       << entry.object_key
-                       << ", sequence_id=" << entry.sequence_id;
-        }
-        return;
+        return metadata_store_->PutMetadata(entry.tenant_id, entry.object_key,
+                                            StandbyObjectMetadata{});
     }
-
-    // Deserialize payload using struct_pack (msgpack binary format)
     MetadataPayload payload;
-    auto result = struct_pack::deserialize_to(payload, entry.payload);
-    if (result != struct_pack::errc::ok) {
-        LOG(ERROR) << "OpLogApplier: failed to deserialize payload for key="
-                   << entry.object_key << ", sequence_id=" << entry.sequence_id
-                   << ", payload_size=" << entry.payload.size()
-                   << ", error_code=" << static_cast<int>(result);
-        // Fallback to empty metadata if parsing fails
-        StandbyObjectMetadata empty_metadata;
-        metadata_store_->PutMetadata(entry.tenant_id, entry.object_key,
-                                     empty_metadata);
-        return;
+    if (struct_pack::deserialize_to(payload, entry.payload) !=
+        struct_pack::errc::ok) {
+        LOG(ERROR) << "Invalid PUT_END payload, sequence_id="
+                   << entry.sequence_id;
+        return false;
     }
-
-    // Convert to StandbyObjectMetadata and store
-    StandbyObjectMetadata metadata = payload.ToStandbyMetadata();
-
-    if (!metadata_store_->PutMetadata(entry.tenant_id, entry.object_key,
-                                      metadata)) {
-        LOG(ERROR) << "OpLogApplier: failed to PutMetadata key="
-                   << entry.object_key << ", sequence_id=" << entry.sequence_id;
-    } else {
-        VLOG(1) << "OpLogApplier: applied PUT_END, key=" << entry.object_key
-                << ", sequence_id=" << entry.sequence_id
-                << ", replicas=" << metadata.replicas.size()
-                << ", size=" << metadata.size;
-    }
+    return metadata_store_->PutMetadata(entry.tenant_id, entry.object_key,
+                                        payload.ToStandbyMetadata());
 }
 
 void OpLogApplier::ApplyPutRevoke(const OpLogEntry& entry) {
@@ -426,13 +393,13 @@ void OpLogApplier::LoadSegmentRegistry(
     }
 }
 
-void OpLogApplier::ApplySegmentMount(const OpLogEntry& entry) {
+bool OpLogApplier::ApplySegmentMount(const OpLogEntry& entry) {
     SegmentMountOp op;
     if (struct_pack::deserialize_to(op, entry.payload) !=
         struct_pack::errc::ok) {
         LOG(ERROR) << "Failed to deserialize SEGMENT_MOUNT payload for key "
                    << entry.object_key;
-        return;
+        return false;
     }
     StandbySegmentInfo info;
     info.segment_name = op.segment_name;
@@ -441,26 +408,28 @@ void OpLogApplier::ApplySegmentMount(const OpLogEntry& entry) {
     info.is_memory_segment = op.is_memory_segment;
     info.file_path = op.file_path;
     segment_registry_.OnSegmentMount(info);
+    return true;
 }
 
-void OpLogApplier::ApplySegmentUnmount(const OpLogEntry& entry) {
+bool OpLogApplier::ApplySegmentUnmount(const OpLogEntry& entry) {
     SegmentUnmountOp op;
     if (struct_pack::deserialize_to(op, entry.payload) !=
         struct_pack::errc::ok) {
         LOG(ERROR) << "Failed to deserialize SEGMENT_UNMOUNT payload for key "
                    << entry.object_key;
-        return;
+        return false;
     }
     segment_registry_.OnSegmentUnmount(op.transport_endpoint);
+    return true;
 }
 
-void OpLogApplier::ApplySegmentUpdate(const OpLogEntry& entry) {
+bool OpLogApplier::ApplySegmentUpdate(const OpLogEntry& entry) {
     SegmentUpdateOp op;
     if (struct_pack::deserialize_to(op, entry.payload) !=
         struct_pack::errc::ok) {
         LOG(ERROR) << "Failed to deserialize SEGMENT_UPDATE payload for key "
                    << entry.object_key;
-        return;
+        return false;
     }
     StandbySegmentInfo info;
     info.segment_name = op.segment_name;
@@ -469,6 +438,7 @@ void OpLogApplier::ApplySegmentUpdate(const OpLogEntry& entry) {
     info.is_memory_segment = op.is_memory_segment;
     info.file_path = op.file_path;
     segment_registry_.OnSegmentUpdate(info);
+    return true;
 }
 
 bool OpLogApplier::ApplyNoFSegmentMount(const OpLogEntry& entry) {

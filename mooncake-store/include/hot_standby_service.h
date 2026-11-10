@@ -29,6 +29,7 @@ namespace mooncake {
 class MasterService;
 class HaKvBackend;
 class OpLogBatchStandbyReader;
+class MasterServiceConfig;
 enum class OpLogBatchStandbyPollDisposition;
 struct OpLogBatchStandbyPollResult;
 
@@ -87,6 +88,7 @@ class HotStandbyService {
     using SyncStatusCallback = std::function<void(const StandbySyncStatus&)>;
 
     explicit HotStandbyService(const HotStandbyConfig& config);
+    void SetPreparationConfig(const MasterServiceConfig& config);
     ~HotStandbyService();
 
     /**
@@ -139,7 +141,8 @@ class HotStandbyService {
     ErrorCode PreservePromotionBaseline(
         std::unique_ptr<StandbyMetadataStore> metadata_store,
         DurablePrefix applied_cursor, ViewVersionId producer_view_version,
-        std::vector<StandbySegmentInfo> segments);
+        std::vector<StandbySegmentInfo> segments,
+        std::shared_ptr<PreparedStandbyState> prepared_state = nullptr);
 
     /**
      * @brief Promote this standby to Primary and export a snapshot atomically.
@@ -247,6 +250,11 @@ class HotStandbyService {
     ErrorCode LoadSnapshotBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode LoadBatchOpLogSnapshotBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode StartOplogFollowingLocked(uint64_t baseline_seq_id);
+    ErrorCode PrepareRuntime(StandbyMetadataStore& metadata,
+                             const StandbySegmentRegistry& registry,
+                             DurablePrefix cursor,
+                             std::shared_ptr<PreparedStandbyState>& result);
+    ErrorCode SynchronizePreparedRuntime(OpLogBatchStandbyReader& reader);
     void ActivateSnapshotOnlyStandbyLocked(uint64_t baseline_seq_id);
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id,
@@ -280,6 +288,8 @@ class HotStandbyService {
     HotStandbyConfig config_;
 
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
+    std::shared_ptr<const MasterServiceConfig> preparation_config_;
+    std::shared_ptr<PreparedStandbyState> prepared_state_;
     std::shared_ptr<BatchOpLogSnapshotProvider> batch_oplog_snapshot_provider_;
 
     // OpLog replication components

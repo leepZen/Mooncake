@@ -55,9 +55,9 @@ class OpLogApplier {
     void Recover(uint64_t last_applied_sequence_id);
 
     const StandbySegmentRegistry& GetSegmentRegistry() const;
-    void ApplySegmentMount(const OpLogEntry& entry);
-    void ApplySegmentUnmount(const OpLogEntry& entry);
-    void ApplySegmentUpdate(const OpLogEntry& entry);
+    bool ApplySegmentMount(const OpLogEntry& entry);
+    bool ApplySegmentUnmount(const OpLogEntry& entry);
+    bool ApplySegmentUpdate(const OpLogEntry& entry);
 
     /**
      * @brief Load segment registry from snapshot baseline.
@@ -70,7 +70,7 @@ class OpLogApplier {
      * @brief Apply PUT_END operation
      * @param entry OpLog entry
      */
-    void ApplyPutEnd(const OpLogEntry& entry);
+    bool ApplyPutEnd(const OpLogEntry& entry);
 
     /**
      * @brief Apply PUT_REVOKE operation

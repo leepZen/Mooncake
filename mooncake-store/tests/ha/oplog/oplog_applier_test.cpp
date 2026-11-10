@@ -501,17 +501,12 @@ TEST_F(OpLogApplierTest, TestApplyPutEnd_InvalidPayload) {
     std::string invalid_data = "{invalid data}";
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", invalid_data);
 
-    // Should still succeed (fallback to empty metadata)
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
+    EXPECT_FALSE(applier_->ApplyOpLogEntry(entry));
+    EXPECT_EQ(1u, applier_->GetExpectedSequenceId());
+    EXPECT_FALSE(mock_metadata_store_->Exists("key1"));
+    auto retry = MakeEntry(1, OpType::PUT_END, "key1", MakeValidPayload());
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(retry));
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
-    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
-
-    // Metadata should exist but with default values
-    auto meta = mock_metadata_store_->GetMetadata("key1");
-    ASSERT_TRUE(meta.has_value());
-    EXPECT_EQ(0u, meta->client_id.first);
-    EXPECT_EQ(0u, meta->client_id.second);
-    EXPECT_EQ(0u, meta->size);
 }
 
 TEST_F(OpLogApplierTest, TestApplyPutEnd_EmptyPayload) {
@@ -747,9 +742,9 @@ TEST_F(OpLogApplierTest, TestApplySegmentUpdate) {
 TEST_F(OpLogApplierTest, TestApplySegmentMount_InvalidPayload) {
     OpLogEntry entry = MakeEntry(1, OpType::SEGMENT_MOUNT, "seg1", "garbage");
 
-    // Should not crash, but should not add segment either
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
-    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
+    // A failed mutation must not advance the prepared boundary.
+    EXPECT_FALSE(applier_->ApplyOpLogEntry(entry));
+    EXPECT_EQ(1u, applier_->GetExpectedSequenceId());
     EXPECT_FALSE(applier_->GetSegmentRegistry().HasSegment("seg1"));
 }
 

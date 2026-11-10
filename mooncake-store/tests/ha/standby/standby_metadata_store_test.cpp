@@ -78,6 +78,41 @@ TEST(StandbyMetadataStoreTest, RestoreInsertRejectsDuplicateWithoutOverwrite) {
     EXPECT_EQ(1u, restored->size);
 }
 
+TEST(StandbyMetadataStoreTest,
+     IncrementalReplicaValidationSurvivesOverwriteAndDrain) {
+    StandbyMetadataStore store;
+    auto metadata = MakeMetadata(1);
+    Replica::Descriptor replica;
+    replica.id = 7;
+    replica.descriptor_variant = DiskDescriptor{"file", 1};
+    metadata.replicas.push_back(replica);
+    ASSERT_TRUE(store.RestoreMetadata("tenant", "key", metadata));
+    ReplicaID maximum = 0;
+    EXPECT_TRUE(store.ValidateReplicaIds(maximum));
+    EXPECT_EQ(7u, maximum);
+    metadata.replicas.push_back(replica);
+    store.PutMetadata("tenant", "key", metadata);
+    EXPECT_FALSE(store.ValidateReplicaIds(maximum));
+    metadata.replicas.pop_back();
+    metadata.replicas.front().id = 3;
+    store.PutMetadata("tenant", "key", metadata);
+    EXPECT_TRUE(store.ValidateReplicaIds(maximum));
+    EXPECT_EQ(3u, maximum);
+    store.TrackChanges();
+    std::vector<StandbyObjectEntry> chunk;
+    ASSERT_TRUE(store.DrainChunk(1, chunk));
+    EXPECT_EQ(0u, store.GetKeyCount());
+    EXPECT_TRUE(store.ValidateReplicaIds(maximum));
+    EXPECT_EQ(0u, maximum);
+    EXPECT_EQ((std::set<StandbyMetadataStore::ObjectKey>{{"tenant", "key"}}),
+              store.TakeChangedObjects());
+    EXPECT_TRUE(store.TakeChangedObjects().empty());
+    store.PutMetadata("tenant", "key", metadata);
+    store.Clear();
+    EXPECT_TRUE(store.ValidateReplicaIds(maximum));
+    EXPECT_EQ(0u, maximum);
+}
+
 TEST(StandbyMetadataStoreTest, WeightMetadataSnapshotRoundTripsCompleteState) {
     const WeightRevisionIdentity identity{
         .tenant_id = "default",

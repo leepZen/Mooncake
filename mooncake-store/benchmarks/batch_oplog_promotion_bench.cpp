@@ -8,10 +8,14 @@
 #include <string>
 
 #include "ha/snapshot/batch_oplog/promotion.h"
+#include "ha/prepared_standby_state.h"
 #include "master_service.h"
 
 DEFINE_uint64(objects, 100000, "Synthetic standby object count");
 DEFINE_uint64(chunk_objects, 1000, "Objects drained per chunk");
+DEFINE_bool(prepared, true,
+            "Measure prepared runtime instead of legacy restore");
+DEFINE_uint64(tail_objects, 1, "Objects replaced after initial preparation");
 
 namespace {
 
@@ -37,7 +41,8 @@ int main(int argc, char** argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     if (FLAGS_objects == 0 || FLAGS_chunk_objects == 0 ||
         FLAGS_objects == std::numeric_limits<uint64_t>::max() ||
-        FLAGS_chunk_objects > std::numeric_limits<size_t>::max()) {
+        FLAGS_chunk_objects > std::numeric_limits<size_t>::max() ||
+        FLAGS_tail_objects > FLAGS_objects) {
         std::cerr << "objects and chunk_objects must be non-zero\n";
         return 1;
     }
@@ -55,6 +60,51 @@ int main(int argc, char** argv) {
                                        metadata)) {
             return 1;
         }
+    }
+
+    if (FLAGS_prepared) {
+        using Clock = std::chrono::steady_clock;
+        const auto micros = [](Clock::time_point from, Clock::time_point to) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(to -
+                                                                         from)
+                .count();
+        };
+        auto config = mooncake::MasterServiceConfig::builder()
+                          .set_enable_ha(false)
+                          .build();
+        mooncake::PreparedStandbyState prepared(config);
+        mooncake::StandbySegmentRegistry segments;
+        const auto start = Clock::now();
+        auto error = prepared.Bootstrap(*source_store, segments, {1, 1},
+                                        FLAGS_chunk_objects);
+        const auto bootstrapped = Clock::now();
+        if (error != mooncake::ErrorCode::OK) return 1;
+        for (uint64_t i = 0; i < FLAGS_tail_objects; ++i) {
+            const auto key = "bench-" + std::to_string(i);
+            auto metadata = source_store->GetMetadata("default", key);
+            metadata->session_id = "updated";
+            source_store->PutMetadata("default", key, *metadata);
+        }
+        const auto tail_start = Clock::now();
+        error = prepared.Synchronize(*source_store, segments,
+                                     {2, FLAGS_tail_objects + 1});
+        const auto synchronized = Clock::now();
+        if (error != mooncake::ErrorCode::OK) return 1;
+        config.view_version = 1;
+        error = prepared.BindTerm(config);
+        const auto bound = Clock::now();
+        if (error != mooncake::ErrorCode::OK) return 1;
+        prepared.Service()->ActivatePreparedRuntime();
+        const auto activated = Clock::now();
+        std::cout << "objects=" << FLAGS_objects
+                  << " tail_objects=" << FLAGS_tail_objects
+                  << " prepare_us=" << micros(start, bootstrapped)
+                  << " tail_us=" << micros(tail_start, synchronized)
+                  << " bind_us=" << micros(synchronized, bound)
+                  << " activate_us=" << micros(bound, activated)
+                  << " reconstructed_objects=" << prepared.PreparedObjects()
+                  << " peak_rss_bytes=" << PeakRssBytes() << '\n';
+        return 0;
     }
 
     mooncake::BatchOpLogPromotionHandoff handoff;

@@ -14,6 +14,8 @@
 #include "ha/standby_controller.h"
 #include "hot_standby_service.h"
 #include "master_service.h"
+#include "ha/prepared_standby_state.h"
+#include "master_service/master_service_test_peer.h"
 
 namespace mooncake::test {
 namespace {
@@ -215,6 +217,90 @@ TEST(BatchOpLogPromotionTest, EmptyStoreRestoresWithoutChunks) {
     EXPECT_TRUE(service.RestoreFromBatchOpLogPromotion(handoff, 1).has_value());
     ASSERT_TRUE(handoff.metadata_store);
     EXPECT_EQ(0u, handoff.metadata_store->GetKeyCount());
+}
+
+TEST(BatchOpLogPromotionTest,
+     PreparedHandoffResumesSameRuntimeAfterFailedTerm) {
+    auto backend = std::make_shared<MemoryBackend>();
+    LocalFileSnapshotObjectStore objects("/tmp/mooncake-prepared-handoff");
+    auto standby = MakeBatchSnapshotStandby(backend, objects);
+    // Prepared handoff and rollback must also work with snapshots disabled.
+    standby->SetBatchOpLogSnapshotProvider(nullptr);
+    auto config = MasterServiceConfig::builder().set_enable_ha(false).build();
+    standby->SetPreparationConfig(config);
+    ASSERT_EQ(ErrorCode::OK, standby->Start("", "", "promotion-test"));
+    auto append = [&](uint64_t id, OpType type, const std::string& key) {
+        OpLogEntry entry;
+        entry.sequence_id = id;
+        entry.op_type = type;
+        entry.object_key = key;
+        OpLogBatchRecord batch;
+        batch.batch_id = batch.first_seq = batch.last_seq = id;
+        batch.entries.push_back(entry);
+        EXPECT_EQ(ErrorCode::OK,
+                  backend->Put(BuildBatchRecordKey("promotion-test", id),
+                               EncodeOpLogBatchRecord(batch)));
+        EXPECT_EQ(ErrorCode::OK,
+                  backend->Put(BuildDurablePrefixKey("promotion-test"),
+                               EncodeDurablePrefix({id, id})));
+    };
+    append(1, OpType::PUT_END, "old");
+    auto first = standby->PromoteAndDetachBatchOpLogStore();
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(first->prepared_state);
+    ASSERT_TRUE(first->prepared_state->ReadyAt({1, 1}));
+    auto runtime = first->prepared_state->Service();
+    config.view_version = 7;
+    ASSERT_EQ(ErrorCode::OK, first->prepared_state->BindTerm(config));
+    ASSERT_EQ(ErrorCode::OK,
+              standby->PreservePromotionBaseline(
+                  std::move(first->metadata_store), first->applied_cursor,
+                  first->producer_view_version, std::move(first->segments),
+                  std::move(first->prepared_state)));
+    ASSERT_EQ(ErrorCode::OK, standby->Start("", "", "promotion-test"));
+    append(2, OpType::REMOVE, "old");
+    append(3, OpType::PUT_END, "new");
+    auto second = standby->PromoteAndDetachBatchOpLogStore();
+    ASSERT_TRUE(second);
+    ASSERT_TRUE(second->prepared_state);
+    EXPECT_EQ(runtime.get(), second->prepared_state->Service().get());
+    EXPECT_TRUE(second->prepared_state->ReadyAt({3, 3}));
+    EXPECT_EQ(2u, second->prepared_state->PreparedObjects());
+    MasterServiceTestPeer::MetadataAccessorRO removed(
+        runtime.get(), {TenantId::Default(), "old"});
+    EXPECT_FALSE(removed.IsPublished());
+}
+
+TEST(BatchOpLogPromotionTest, PreparedEmptyCursorSurvivesFailedPromotion) {
+    auto backend = std::make_shared<MemoryBackend>();
+    // Producer fencing initializes this key before the supervisor promotes.
+    // Once a baseline is installed, a missing prefix must still fail closed.
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildDurablePrefixKey("promotion-test"),
+                           EncodeDurablePrefix({0, 0})));
+    LocalFileSnapshotObjectStore objects(
+        "/tmp/mooncake-prepared-empty-handoff");
+    auto standby = MakeBatchSnapshotStandby(backend, objects);
+    standby->SetBatchOpLogSnapshotProvider(nullptr);
+    auto config = MasterServiceConfig::builder().set_enable_ha(false).build();
+    standby->SetPreparationConfig(config);
+    ASSERT_EQ(ErrorCode::OK, standby->Start("", "", "promotion-test"));
+    auto first = standby->PromoteAndDetachBatchOpLogStore();
+    ASSERT_TRUE(first);
+    auto runtime = first->prepared_state->Service();
+    config.view_version = 7;
+    ASSERT_EQ(ErrorCode::OK, first->prepared_state->BindTerm(config));
+    ASSERT_EQ(ErrorCode::OK,
+              standby->PreservePromotionBaseline(
+                  std::move(first->metadata_store), first->applied_cursor,
+                  first->producer_view_version, std::move(first->segments),
+                  std::move(first->prepared_state)));
+    ASSERT_EQ(ErrorCode::OK, standby->Start("", "", "promotion-test"));
+    auto second = standby->PromoteAndDetachBatchOpLogStore();
+    ASSERT_TRUE(second);
+    ASSERT_TRUE(second->prepared_state);
+    EXPECT_EQ(runtime.get(), second->prepared_state->Service().get());
+    EXPECT_TRUE(second->prepared_state->ReadyAt({0, 0}));
 }
 
 }  // namespace mooncake::test

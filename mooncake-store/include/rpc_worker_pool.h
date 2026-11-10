@@ -40,6 +40,9 @@ class PooledHandler<Method, Service, std::tuple<Params...>> {
         : service_(service), executor_(executor) {}
 
     async_simple::coro::Lazy<Result> Handle(Params... params) {
+        if constexpr (requires { service_.CheckRpcReady(); }) {
+            service_.CheckRpcReady();
+        }
         auto result = co_await coro_io::post(
             [&]() -> Result {
                 return (service_.*Method)(std::move(params)...);

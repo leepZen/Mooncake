@@ -126,6 +126,29 @@ TEST(StandbyControllerTest, BatchSnapshotRepeatedStartStopAndPromotion) {
     if (!endpoints) GTEST_SKIP() << "Run with the real-etcd snapshot smoke";
     ScopedSnapshotLocalPath local_path("batch-lifecycle-");
     MasterServiceSupervisorConfig config;
+    // A prepared standby starts the same runtime as a serving primary.
+    const MasterServiceConfig runtime;
+    config.metrics = MetricsBootstrapConfig{};
+    config.default_kv_lease_ttl = runtime.default_kv_lease_ttl;
+    config.default_kv_soft_pin_ttl = runtime.default_kv_soft_pin_ttl;
+    config.allow_evict_soft_pinned_objects =
+        runtime.allow_evict_soft_pinned_objects;
+    config.eviction_ratio = runtime.eviction_ratio;
+    config.eviction_high_watermark_ratio =
+        runtime.eviction_high_watermark_ratio;
+    config.nof_eviction_ratio = runtime.nof_eviction_ratio;
+    config.nof_eviction_high_watermark_ratio =
+        runtime.nof_eviction_high_watermark_ratio;
+    config.client_active_ttl_sec = runtime.client_active_ttl_sec;
+    config.client_suspicion_ttl_sec = runtime.client_suspicion_ttl_sec;
+    config.nof_heartbeat_interval_sec = runtime.nof_heartbeat_interval_sec;
+    config.nof_heartbeat_probe_timeout_ms =
+        runtime.nof_heartbeat_probe_timeout_ms;
+    config.nof_heartbeat_failures_threshold =
+        runtime.nof_heartbeat_failures_threshold;
+    config.enable_offload = runtime.enable_offload;
+    config.rpc_port = 0;
+    config.rpc_thread_num = 1;
     config.cluster_id = "batch-lifecycle-" + UuidToString(generate_uuid());
     config.enable_oplog = true;
     config.enable_oplog_snapshot = true;
@@ -147,6 +170,20 @@ TEST(StandbyControllerTest, BatchSnapshotRepeatedStartStopAndPromotion) {
     EXPECT_NE(nullptr, promoted->metadata_store);
     ASSERT_EQ(ErrorCode::OK, controller->StartStandby(std::nullopt));
     controller.reset();  // Destruction while both workers are running.
+}
+
+TEST(StandbyControllerTest, IncompleteRuntimeConfigIsReportedAtStart) {
+    ha::HABackendSpec spec{};
+    spec.type = ha::HABackendType::ETCD;
+    MasterServiceSupervisorConfig config;
+    config.enable_oplog = true;
+    auto controller = ha::CreateStandbyController(spec, config);
+    ASSERT_TRUE(controller);
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
+              controller->StartStandby(std::nullopt));
+    auto promoted = controller->PromoteStandbyAndExport();
+    ASSERT_FALSE(promoted);
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, promoted.error());
 }
 
 TEST(StandbyControllerTest, HaWithoutOplogPromotesWithEmptyContext) {

@@ -204,7 +204,7 @@ bool MasterService::DefaultProbeNofSegment(const std::string& te_endpoint,
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
-MasterService::MasterService(const MasterServiceConfig& config)
+MasterService::MasterService(const MasterServiceConfig& config, StartMode mode)
     : graceful_unmount_scheduler_(
           [this](const GracefulUnmountDeadlineRecord& record) {
               auto result =
@@ -425,6 +425,35 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 
     InitDfsAllocatorFromEnvironment(config);
+    standby_runtime_ = mode == StartMode::kStandby;
+    if (!standby_runtime_) {
+        InitializeTermServices(config);
+        StartBackgroundTasks();
+    }
+
+    if (!root_fs_dir_.empty()) {
+        use_disk_replica_ = true;
+        if (config.global_file_segment_size ==
+            std::numeric_limits<int64_t>::max()) {
+            MasterMetricManager::instance().set_dfs_capacity_unlimited(true);
+        } else {
+            MasterMetricManager::instance().inc_total_file_capacity(
+                config.global_file_segment_size);
+        }
+    }
+
+    if (config.enable_cxl) {
+        allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
+        const auto result = segment_manager_.initializeCxlAllocator(
+            config.cxl_path, config.cxl_size);
+        LOG_IF(FATAL, result != ErrorCode::OK)
+            << "Failed to initialize CXL allocator: "
+            << static_cast<int>(result);
+        VLOG(1) << "action=start_cxl_global_allocator";
+    }
+}
+
+void MasterService::InitializeTermServices(const MasterServiceConfig& config) {
     kv_event_publisher_ =
         std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
     kv_track_tenant_epochs_ = KvEventsEnabled();
@@ -462,7 +491,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
             }
         }
     }
+}
 
+void MasterService::StartBackgroundTasks() {
     // This worker is part of the Client lifecycle protocol. Start it before
     // any raw std::thread so a startup failure can unwind the constructor
     // normally instead of encountering joinable thread destructors.
@@ -509,26 +540,15 @@ MasterService::MasterService(const MasterServiceConfig& config)
         std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
         TrySubmitDynamicReplicaProposal(ObjectIdentity{tenant_id, key});
     });
+}
 
-    if (!root_fs_dir_.empty()) {
-        use_disk_replica_ = true;
-        if (config.global_file_segment_size ==
-            std::numeric_limits<int64_t>::max()) {
-            MasterMetricManager::instance().set_dfs_capacity_unlimited(true);
-        } else {
-            MasterMetricManager::instance().inc_total_file_capacity(
-                config.global_file_segment_size);
-        }
-    }
-
-    if (config.enable_cxl) {
-        allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
-        const auto result = segment_manager_.initializeCxlAllocator(
-            config.cxl_path, config.cxl_size);
-        LOG_IF(FATAL, result != ErrorCode::OK)
-            << "Failed to initialize CXL allocator: "
-            << static_cast<int>(result);
-        VLOG(1) << "action=start_cxl_global_allocator";
+void MasterService::ActivatePreparedRuntime() {
+    if (!standby_runtime_) return;
+    activation_time_ = std::chrono::steady_clock::now();
+    StartBackgroundTasks();
+    standby_runtime_.store(false, std::memory_order_release);
+    if (!http_metadata_remote_url_.empty()) {
+        setHttpMetadataRemoteUrl(http_metadata_remote_url_);
     }
 }
 
@@ -1001,10 +1021,11 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 return standby_accounted_memory_bytes_.contains(segment.name);
             });
         if (any_standby_kept_alive) {
-            VisitTenants([&](const TenantId& tenant_id) {
-                for (auto object : WriteCursor(tenant_id)) {
+            const auto collect =
+                [&](const TenantId& tenant_id, ObjectMetadata& metadata,
+                    const route::ObjectRef& ref) {
                     bool affected = false;
-                    object.metadata().VisitReplicas(
+                    metadata.VisitReplicas(
                         [](const Replica& replica) {
                             return replica.is_memory_replica() &&
                                    replica.status() != ReplicaStatus::REMOVED &&
@@ -1054,10 +1075,32 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                             }
                         });
                     if (affected) {
-                        affected_objects.emplace_back(tenant_id, object.ref());
+                        affected_objects.emplace_back(tenant_id, ref);
+                    }
+                };
+            if (standby_replica_index_complete_) {
+                std::map<StandbyObjectKey, route::ObjectRef> candidates;
+                for (const auto& segment : segments) {
+                    for (const auto& alias :
+                         {segment.name, segment.te_endpoint}) {
+                        auto found = standby_replica_index_.find(alias);
+                        if (found != standby_replica_index_.end())
+                            candidates.insert(found->second.begin(),
+                                              found->second.end());
                     }
                 }
-            });
+                for (const auto& [key, ref] : candidates) {
+                    TenantId tenant(key.first);
+                    MetadataAccessorRW object(this, tenant, ref);
+                    if (object.IsPublished())
+                        collect(tenant, object.Get(), ref);
+                }
+            } else {
+                VisitTenants([&](const TenantId& tenant_id) {
+                    for (auto object : WriteCursor(tenant_id))
+                        collect(tenant_id, object.metadata(), object.ref());
+                });
+            }
         }
         if (ambiguous_endpoint) {
             return fail_remount(ErrorCode::INVALID_PARAMS);
@@ -11712,6 +11755,12 @@ void MasterService::EvictSoftPinExpired(
 void MasterService::ClientMonitorFunc() {
     while (client_monitor_running_) {
         const auto now = ClientLivenessRecord::Clock::now();
+        if (activation_time_ != ClientLivenessRecord::TimePoint{} &&
+            now - activation_time_ <
+                std::chrono::seconds(client_active_ttl_sec_)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
         std::vector<std::pair<UUID, std::shared_ptr<ClientLivenessRecord>>>
             clients;
         {
@@ -13382,6 +13431,7 @@ void MasterService::setHttpMetadataRemoteUrl(
     LOG(INFO) << "HTTP metadata cleanup on client timeout: enabled "
                  "(remote metadata server "
               << metadata_connstring << ")";
+    if (standby_runtime_) return;
     // Start async cleanup worker now that http_metadata_remote_url_ is set.
     http_metadata_cleanup_running_ = true;
     http_metadata_cleanup_thread_ =

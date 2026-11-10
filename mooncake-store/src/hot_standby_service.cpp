@@ -1,4 +1,5 @@
 #include "hot_standby_service.h"
+#include "ha/prepared_standby_state.h"
 
 #include <glog/logging.h>
 
@@ -44,6 +45,49 @@ HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
 
         NotifySyncStatus();
     });
+}
+
+void HotStandbyService::SetPreparationConfig(
+    const MasterServiceConfig& config) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    preparation_config_ = std::make_shared<MasterServiceConfig>(config);
+}
+
+ErrorCode HotStandbyService::PrepareRuntime(
+    StandbyMetadataStore& metadata, const StandbySegmentRegistry& registry,
+    DurablePrefix cursor, std::shared_ptr<PreparedStandbyState>& result) {
+    if (!preparation_config_) return ErrorCode::OK;
+    try {
+        auto next =
+            std::make_shared<PreparedStandbyState>(*preparation_config_);
+        auto error =
+            next->Bootstrap(metadata, registry, cursor,
+                            preparation_config_->snapshot_chunk_object_count);
+        if (error != ErrorCode::OK) return error;
+        result = std::move(next);
+        return ErrorCode::OK;
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "Standby runtime preparation failed: " << error.what();
+        return ErrorCode::INTERNAL_ERROR;
+    }
+}
+
+ErrorCode HotStandbyService::SynchronizePreparedRuntime(
+    OpLogBatchStandbyReader& reader) {
+    if (!prepared_state_) return ErrorCode::OK;
+    auto cursor = reader.GetLastAppliedDurablePrefix();
+    const auto sequence = GetLocalLastAppliedSequenceIdLocked();
+    if (!cursor && sequence == 0) cursor = DurablePrefix{};
+    // A paginated read can finish between durable publication boundaries.
+    // Keep accumulating dirty keys until all entries at the boundary exist.
+    if (!cursor || cursor->last_seq != sequence) return ErrorCode::OK;
+    try {
+        return prepared_state_->Synchronize(
+            *metadata_store_, oplog_applier_->GetSegmentRegistry(), *cursor);
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "Standby runtime apply failed: " << error.what();
+        return ErrorCode::INTERNAL_ERROR;
+    }
 }
 
 HotStandbyService::~HotStandbyService() {
@@ -157,6 +201,19 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
         return ErrorCode::OK;
     }
 
+    if (!preserve_baseline || !prepared_state_ ||
+        !prepared_state_->ReadyAt(
+            batch_snapshot_baseline_.value_or(DurablePrefix{}))) {
+        prepared_state_.reset();
+        const auto error = PrepareRuntime(
+            *metadata_store_, oplog_applier_->GetSegmentRegistry(),
+            batch_snapshot_baseline_.value_or(DurablePrefix{}),
+            prepared_state_);
+        if (error != ErrorCode::OK) {
+            state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+            return error;
+        }
+    }
     return StartOplogFollowingLocked(baseline_seq_id);
 }
 
@@ -185,7 +242,7 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
 
     oplog_applier_ =
         std::make_unique<OpLogApplier>(metadata_store_.get(), cluster_id_);
-    if (batch_oplog_snapshot_provider_ && config_.enable_snapshot_bootstrap) {
+    {
         if (preserve_promotion_baseline_ && metadata_store_ &&
             batch_snapshot_baseline_) {
             const uint64_t preserved_seq = batch_snapshot_baseline_->last_seq;
@@ -209,7 +266,8 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
             return ErrorCode::OK;
         }
         preserve_promotion_baseline_ = false;
-        return LoadBatchOpLogSnapshotBaselineLocked(baseline_seq_id);
+        if (batch_oplog_snapshot_provider_ && config_.enable_snapshot_bootstrap)
+            return LoadBatchOpLogSnapshotBaselineLocked(baseline_seq_id);
     }
     if (has_recoverable_local_state) {
         LOG(INFO) << "Standby warm start: reuse local metadata (keys="
@@ -565,6 +623,10 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
             oplog_applier_->GetExpectedSequenceId();
         const auto cursor_before = reader->GetLastAppliedDurablePrefix();
         auto result = reader->PollOnce();
+        if (result.error == ErrorCode::OK) {
+            const auto error = SynchronizePreparedRuntime(*reader);
+            if (error != ErrorCode::OK) return error;
+        }
         const uint64_t expected_after = oplog_applier_->GetExpectedSequenceId();
         const auto cursor_after = reader->GetLastAppliedDurablePrefix();
         const bool made_progress =
@@ -626,7 +688,8 @@ void HotStandbyService::MarkAppliedCursorForRestart() {
 ErrorCode HotStandbyService::PreservePromotionBaseline(
     std::unique_ptr<StandbyMetadataStore> metadata_store,
     DurablePrefix applied_cursor, ViewVersionId producer_view_version,
-    std::vector<StandbySegmentInfo> segments) {
+    std::vector<StandbySegmentInfo> segments,
+    std::shared_ptr<PreparedStandbyState> prepared_state) {
     std::lock_guard<std::mutex> lock(mutex_);
     const StandbyState state = GetState();
     if (state != StandbyState::STOPPED && state != StandbyState::FAILED) {
@@ -634,9 +697,12 @@ ErrorCode HotStandbyService::PreservePromotionBaseline(
                    << StandbyStateToString(state);
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
-    if (!metadata_store || applied_cursor.last_seq == 0) {
+    if (!metadata_store ||
+        ((applied_cursor.last_seq == 0) != (applied_cursor.batch_id == 0))) {
         return ErrorCode::INVALID_PARAMS;
     }
+    if (prepared_state) prepared_state->AbortTerm();
+    prepared_state_ = std::move(prepared_state);
     metadata_store_ = std::move(metadata_store);
     batch_snapshot_baseline_ = applied_cursor;
     batch_snapshot_producer_view_version_ = producer_view_version;
@@ -798,15 +864,15 @@ ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
 bool HotStandbyService::IsBatchOpLogSnapshotMode() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return config_.enable_oplog_following &&
-           batch_oplog_snapshot_provider_ != nullptr &&
+           (batch_oplog_snapshot_provider_ != nullptr || preparation_config_) &&
            batch_standby_reader_ != nullptr;
 }
 
 tl::expected<BatchOpLogPromotionHandoff, ErrorCode>
 HotStandbyService::PromoteAndDetachBatchOpLogStore() {
     std::unique_lock<std::mutex> lock(mutex_);
-    if (!batch_oplog_snapshot_provider_ || !config_.enable_oplog_following ||
-        !batch_standby_reader_) {
+    if ((!batch_oplog_snapshot_provider_ && !preparation_config_) ||
+        !config_.enable_oplog_following || !batch_standby_reader_) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     if (!IsReadyForPromotion()) {
@@ -841,6 +907,12 @@ HotStandbyService::PromoteAndDetachBatchOpLogStore() {
         return tl::make_unexpected(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
     }
 
+    if (preparation_config_ &&
+        (!prepared_state_ || !prepared_state_->ReadyAt(*applied_cursor))) {
+        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
+        return tl::make_unexpected(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
+    }
+
     ReplicaID max_replica_id = 0;
     if (!metadata_store_->ValidateReplicaIds(max_replica_id)) {
         state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
@@ -866,6 +938,7 @@ HotStandbyService::PromoteAndDetachBatchOpLogStore() {
         .applied_cursor = *applied_cursor,
         .producer_view_version = producer_view_version,
         .max_replica_id = max_replica_id,
+        .prepared_state = std::move(prepared_state_),
     };
     batch_standby_reader_.reset();
     oplog_applier_.reset();
@@ -1121,6 +1194,10 @@ ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
         cursor->last_seq < applied_seq_id_.load()) {
         return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
     }
+    std::shared_ptr<PreparedStandbyState> prepared;
+    err = PrepareRuntime(*metadata, applier->GetSegmentRegistry(), *cursor,
+                         prepared);
+    if (err != ErrorCode::OK) return err;
     TestFailPoint::Wait("standby_rebootstrap_before_swap");
     uint64_t current_floor = 0;
     OpLogBatchStorage storage(cluster_id_, *batch_standby_kv_backend_);
@@ -1143,6 +1220,7 @@ ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
     }
     // Swapping preserves old state until all replacement references exist.
     // Locals destroy the old reader before its applier and metadata store.
+    prepared_state_.swap(prepared);
     metadata_store_.swap(metadata);
     oplog_applier_.swap(applier);
     batch_standby_reader_.swap(reader);
@@ -1209,6 +1287,15 @@ void HotStandbyService::ReplicationLoop() {
             const uint64_t expected_before =
                 oplog_applier_->GetExpectedSequenceId();
             auto result = batch_standby_reader_->PollOnce();
+            if (result.error == ErrorCode::OK) {
+                const auto error =
+                    SynchronizePreparedRuntime(*batch_standby_reader_);
+                if (error != ErrorCode::OK) {
+                    result.error = error;
+                    result.disposition =
+                        OpLogBatchStandbyPollDisposition::FATAL;
+                }
+            }
             if (result.durable_prefix_present ||
                 result.disposition ==
                     OpLogBatchStandbyPollDisposition::REBOOTSTRAP_REQUIRED) {

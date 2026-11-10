@@ -4,6 +4,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -86,6 +87,12 @@ class StandbyMetadataStore final : public MetadataStore {
 
     void Snapshot(std::vector<StandbyObjectEntry>& out) const;
     bool ValidateReplicaIds(ReplicaID& max_replica_id) const;
+    using ObjectKey = std::pair<std::string, std::string>;
+    // Single replay writer; changes are consumed only at a complete durable
+    // boundary. Snapshot import enables tracking after its initial build.
+    void TrackChanges();
+    std::set<ObjectKey> TakeChangedObjects();
+    uint64_t WeightRevision() const;
     bool DrainChunk(size_t count, std::vector<StandbyObjectEntry>& out);
     // Mutations must remain frozen for the lifetime of the returned cursor.
     SnapshotCursor BeginSnapshotTraversal() const;
@@ -95,6 +102,13 @@ class StandbyMetadataStore final : public MetadataStore {
    private:
     mutable std::mutex mutex_;
     TenantStore store_;
+    void AccountReplicaIds(const StandbyObjectMetadata& metadata, bool add);
+    std::map<ReplicaID, size_t> live_max_ids_;
+    size_t invalid_id_objects_{0};
+    size_t key_count_{0};
+    bool track_changes_{false};
+    std::set<ObjectKey> changed_objects_;
+    uint64_t weight_revision_{0};
     std::map<WeightRevisionIdentity, WeightRevisionMetadata> weight_metadata_;
     std::map<WeightRevisionIdentity, uint64_t> weight_metadata_tombstones_;
     std::unordered_map<uint64_t, WeightRevisionLease> weight_leases_;

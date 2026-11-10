@@ -12,6 +12,7 @@
 #include <functional>
 #include <list>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -123,6 +124,7 @@ class MasterService {
     friend class MasterStoreBackend;
     friend class test::MasterServiceTestPeer;
     friend class ClientOffboardingWorker;
+    friend class PreparedStandbyState;
 
    public:
     using NoFProbeFn =
@@ -134,7 +136,15 @@ class MasterService {
             OrderedOpLogWriterConfig, OrderedOpLogWriter::WriteBatchFn)>;
 
     MasterService();
-    MasterService(const MasterServiceConfig& config);
+    enum class StartMode { kServing, kStandby };
+    MasterService(const MasterServiceConfig& config,
+                  StartMode mode = StartMode::kServing);
+    // Called only behind the supervisor serving gate, after the term has
+    // bound its writer and passed the final leadership check.
+    void ActivatePreparedRuntime();
+    bool IsRuntimeServing() const {
+        return !standby_runtime_.load(std::memory_order_acquire);
+    }
     ~MasterService();
 
     [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
@@ -2714,6 +2724,15 @@ class MasterService {
         standby_allocator_keepalive_;
     std::vector<StandbySegmentInfo> standby_memory_segments_;
     std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
+    using StandbyObjectKey = StandbyMetadataStore::ObjectKey;
+    std::unordered_map<std::string,
+                       std::map<StandbyObjectKey, route::ObjectRef>>
+        standby_replica_index_;
+    bool standby_replica_index_complete_{false};
+    std::atomic<bool> standby_runtime_{false};
+    std::chrono::steady_clock::time_point activation_time_{};
+    void InitializeTermServices(const MasterServiceConfig& config);
+    void StartBackgroundTasks();
 
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 

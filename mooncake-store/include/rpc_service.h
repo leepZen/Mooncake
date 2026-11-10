@@ -19,8 +19,12 @@ namespace mooncake {
 
 // Forward declaration
 class HttpMetadataServer;
+class RpcWorkerPool;
 class WrappedMasterService {
    public:
+    // The listener can be bound before readiness is published. Reject calls
+    // until the prepared runtime has been activated by the serving gate.
+    void CheckRpcReady() const;
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
     void StopBatchOpLogWriter();
@@ -31,9 +35,11 @@ class WrappedMasterService {
     //   metadata server is deployed separately (empty = none). Only consulted
     //   when http_metadata_server is nullptr. If both are unset, cleanup is
     //   disabled.
-    WrappedMasterService(const WrappedMasterServiceConfig& config,
-                         HttpMetadataServer* http_metadata_server = nullptr,
-                         const std::string& http_metadata_remote_url = "");
+    WrappedMasterService(
+        const WrappedMasterServiceConfig& config,
+        HttpMetadataServer* http_metadata_server = nullptr,
+        const std::string& http_metadata_remote_url = "",
+        std::shared_ptr<MasterService> prepared_service = nullptr);
 
     ~WrappedMasterService();
 
@@ -378,7 +384,11 @@ class WrappedMasterService {
     KvEventPublisher::Stats GetKvEventStats() const;
 
    private:
-    MasterService master_service_;
+    friend void RegisterRpcService(coro_rpc::coro_rpc_server&,
+                                   WrappedMasterService&, RpcWorkerPool*);
+    std::shared_ptr<MasterService> owned_master_service_;
+    MasterService& master_service_;
+    std::unique_ptr<RpcWorkerPool> preparation_worker_pool_;
 };
 
 class RpcWorkerPool;

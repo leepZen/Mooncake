@@ -1,4 +1,5 @@
 #include "ha/leadership/master_service_supervisor.h"
+#include "ha/prepared_standby_state.h"
 
 #include <atomic>
 #include <chrono>
@@ -635,8 +636,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                     shutdown_exit("standby_reentry",
                                   term_lease);  // Does not return.
                 }
-                if (promotion_ctx->metadata_store &&
-                    promotion_ctx->applied_cursor.last_seq != 0) {
+                if (promotion_ctx->metadata_store) {
                     const uint64_t applied_seq =
                         promotion_ctx->applied_cursor.last_seq;
                     auto restore_err =
@@ -713,7 +713,10 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         detail::ServingStateGate serving_state;
         auto wrapped_master_service = std::make_shared<WrappedMasterService>(
             wrapped_config, config.http_metadata_server,
-            config.http_metadata_remote_url);
+            config.http_metadata_remote_url,
+            promotion_ctx->prepared_state
+                ? promotion_ctx->prepared_state->Service()
+                : nullptr);
         // Runs the term's handlers once they are registered. It drains before
         // the service goes, so release the service through release_service.
         std::unique_ptr<RpcWorkerPool> worker_pool;
@@ -740,7 +743,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             worker_pool.reset();
             wrapped_master_service.reset();
         };
-        wrapped_master_service->SetBatchOpLogTerminalCallback(
+        auto terminal_callback =
             [&](const OrderedOpLogWriterTerminalState& state) {
                 serving_state.RequestShutdown([&]() {
                     LOG(ERROR) << "Batch OpLog writer terminal: "
@@ -749,23 +752,36 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                     SetRuntimeState(admin_server, MasterRuntimeState::kStandby);
                     server.stop();
                 });
-            });
+            };
+        wrapped_master_service->SetBatchOpLogTerminalCallback(
+            terminal_callback);
 
         // Restore is the serving gate: do not register or expose a candidate
         // service until the complete promotion context has been applied.
         // Keep the handoff until serving is established so restore failure
         // or a later lease loss can still resume from the applied cursor.
         SetRuntimeState(admin_server, MasterRuntimeState::kRecovering);
-        auto restore_result =
-            promotion_ctx->metadata_store
-                ? wrapped_master_service->RestoreFromBatchOpLogPromotion(
-                      *promotion_ctx->metadata_store,
-                      promotion_ctx->applied_cursor, promotion_ctx->segments,
-                      promotion_ctx->max_replica_id,
-                      static_cast<size_t>(config.snapshot_chunk_object_count))
-                : wrapped_master_service->RestoreFromStandby(
-                      promotion_ctx->objects, promotion_ctx->applied_seq_id,
-                      promotion_ctx->segments, promotion_ctx->weight_metadata);
+        auto restore_result = [&]() -> tl::expected<void, ErrorCode> {
+            if (promotion_ctx->prepared_state) {
+                auto error = promotion_ctx->prepared_state->BindTerm(
+                    MasterServiceConfig(wrapped_config), terminal_callback);
+                if (error != ErrorCode::OK) return tl::make_unexpected(error);
+                return {};
+            }
+            return promotion_ctx->metadata_store
+                       ? wrapped_master_service->RestoreFromBatchOpLogPromotion(
+                             *promotion_ctx->metadata_store,
+                             promotion_ctx->applied_cursor,
+                             promotion_ctx->segments,
+                             promotion_ctx->max_replica_id,
+                             static_cast<size_t>(
+                                 config.snapshot_chunk_object_count))
+                       : wrapped_master_service->RestoreFromStandby(
+                             promotion_ctx->objects,
+                             promotion_ctx->applied_seq_id,
+                             promotion_ctx->segments,
+                             promotion_ctx->weight_metadata);
+        }();
         if (ShutdownObserved(shutdown_requested)) {
             std::unique_ptr<LeadershipMonitorHandle> no_monitor;
             stop_term_resources(no_monitor);
@@ -926,6 +942,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             return -1;
         }
 
+        std::jthread handoff_reclaimer;
         ErrorCode publish_ready_err = ErrorCode::OK;
         if (serving_state.IsActive() && !ShutdownObserved(shutdown_requested)) {
             // The backend call can take several seconds. Keep it outside the
@@ -939,13 +956,25 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                     if (ShutdownObserved(shutdown_requested)) {
                         return;
                     }
+                    if (promotion_ctx->prepared_state) {
+                        promotion_ctx->prepared_state->Service()
+                            ->ActivatePreparedRuntime();
+                        promotion_ctx->prepared_state
+                            ->ReleaseActivatedService();
+                    }
                     ActivateServingState(admin_server, wrapped_master_service,
                                          label_reconciler);
                     // Serving owns the restored index now; drop the handoff
                     // so the standby copy is not held for the whole term.
-                    promotion_ctx->metadata_store.reset();
-                    promotion_ctx->objects.clear();
-                    promotion_ctx->segments.clear();
+                    handoff_reclaimer = std::jthread(
+                        [metadata = std::move(promotion_ctx->metadata_store),
+                         objects = std::move(promotion_ctx->objects),
+                         segments = std::move(promotion_ctx->segments),
+                         prepared = std::move(
+                             promotion_ctx->prepared_state)]() mutable {
+                            prepared.reset();
+                            metadata.reset();
+                        });
                 });
             } else {
                 serving_state.RequestShutdown([&]() {

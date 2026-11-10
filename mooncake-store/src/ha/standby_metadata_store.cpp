@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <unordered_set>
+#include <utility>
 
 namespace mooncake {
 
@@ -10,7 +11,17 @@ bool StandbyMetadataStore::PutMetadata(const std::string& tenant_id,
                                        const std::string& key,
                                        const StandbyObjectMetadata& metadata) {
     std::lock_guard<std::mutex> lock(mutex_);
-    store_[NormalizeTenantId(tenant_id)][key] = metadata;
+    const auto tenant = NormalizeTenantId(tenant_id);
+    auto& objects = store_[tenant];
+    auto old = objects.find(key);
+    if (old != objects.end()) {
+        AccountReplicaIds(old->second, false);
+    } else {
+        ++key_count_;
+    }
+    objects[key] = metadata;
+    AccountReplicaIds(metadata, true);
+    if (track_changes_) changed_objects_.emplace(tenant, key);
     return true;
 }
 
@@ -18,7 +29,12 @@ bool StandbyMetadataStore::RestoreMetadata(
     const std::string& tenant_id, const std::string& key,
     const StandbyObjectMetadata& metadata) {
     std::lock_guard<std::mutex> lock(mutex_);
-    return store_[NormalizeTenantId(tenant_id)].emplace(key, metadata).second;
+    const auto tenant = NormalizeTenantId(tenant_id);
+    if (!store_[tenant].emplace(key, metadata).second) return false;
+    ++key_count_;
+    AccountReplicaIds(metadata, true);
+    if (track_changes_) changed_objects_.emplace(tenant, key);
+    return true;
 }
 
 bool StandbyMetadataStore::Put(const std::string& key,
@@ -44,9 +60,15 @@ bool StandbyMetadataStore::Remove(const std::string& tenant_id,
                                   const std::string& key) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto tenant = store_.find(NormalizeTenantId(tenant_id));
-    if (tenant == store_.end() || tenant->second.erase(key) == 0) {
+    if (tenant == store_.end()) {
         return false;
     }
+    auto object = tenant->second.find(key);
+    if (object == tenant->second.end()) return false;
+    AccountReplicaIds(object->second, false);
+    if (track_changes_) changed_objects_.emplace(tenant->first, key);
+    tenant->second.erase(object);
+    --key_count_;
     if (tenant->second.empty()) {
         store_.erase(tenant);
     }
@@ -69,17 +91,18 @@ size_t StandbyMetadataStore::GetKeyCountForTenant(
 
 size_t StandbyMetadataStore::GetKeyCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    size_t count = 0;
-    for (const auto& [tenant_id, objects] : store_) {
-        (void)tenant_id;
-        count += objects.size();
-    }
-    return count;
+    return key_count_;
 }
 
 void StandbyMetadataStore::Clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     store_.clear();
+    live_max_ids_.clear();
+    invalid_id_objects_ = 0;
+    key_count_ = 0;
+    changed_objects_.clear();
+    track_changes_ = false;
+    ++weight_revision_;
     weight_metadata_.clear();
     weight_metadata_tombstones_.clear();
     weight_leases_.clear();
@@ -93,6 +116,7 @@ bool StandbyMetadataStore::PutWeightMetadata(
     const WeightRevisionMetadata& metadata) {
     std::lock_guard<std::mutex> lock(mutex_);
     weight_metadata_[metadata.identity] = metadata;
+    ++weight_revision_;
     return true;
 }
 
@@ -120,12 +144,14 @@ bool StandbyMetadataStore::RemoveWeightMetadata(
     std::lock_guard<std::mutex> lock(mutex_);
     weight_metadata_.erase(identity);
     weight_metadata_tombstones_[identity] = metadata_generation;
+    ++weight_revision_;
     return true;
 }
 
 bool StandbyMetadataStore::PutWeightLease(const WeightRevisionLease& lease) {
     std::lock_guard<std::mutex> lock(mutex_);
     weight_leases_[lease.lease_id] = lease;
+    ++weight_revision_;
     if (lease.lease_id < std::numeric_limits<uint64_t>::max()) {
         next_weight_lease_id_ =
             std::max(next_weight_lease_id_, lease.lease_id + 1);
@@ -168,6 +194,7 @@ bool StandbyMetadataStore::RemoveWeightLease(
         weight_leases_.erase(it);
     }
     weight_lease_tombstones_[lease_id] = std::move(tombstone);
+    ++weight_revision_;
     return true;
 }
 
@@ -198,6 +225,7 @@ bool StandbyMetadataStore::RestoreWeightMetadata(
     weight_operations_ = std::move(operations);
     next_weight_lease_id_ = snapshot.next_lease_id;
     next_weight_operation_id_ = snapshot.next_operation_id;
+    ++weight_revision_;
     return true;
 }
 
@@ -250,23 +278,50 @@ void StandbyMetadataStore::Snapshot(
 
 bool StandbyMetadataStore::ValidateReplicaIds(ReplicaID& max_replica_id) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    max_replica_id = 0;
-    for (const auto& [tenant_id, objects] : store_) {
-        (void)tenant_id;
-        for (const auto& [key, metadata] : objects) {
-            (void)key;
-            std::unordered_set<ReplicaID> object_ids;
-            for (const auto& replica : metadata.replicas) {
-                if (replica.id == 0 ||
-                    replica.id == std::numeric_limits<ReplicaID>::max() ||
-                    !object_ids.insert(replica.id).second) {
-                    return false;
-                }
-                max_replica_id = std::max(max_replica_id, replica.id);
-            }
-        }
+    max_replica_id = live_max_ids_.empty() ? 0 : live_max_ids_.rbegin()->first;
+    return invalid_id_objects_ == 0;
+}
+
+void StandbyMetadataStore::AccountReplicaIds(
+    const StandbyObjectMetadata& metadata, bool add) {
+    ReplicaID maximum = 0;
+    bool valid = true;
+    std::unordered_set<ReplicaID> ids;
+    for (const auto& replica : metadata.replicas) {
+        valid &= replica.id != 0 &&
+                 replica.id != std::numeric_limits<ReplicaID>::max() &&
+                 ids.insert(replica.id).second;
+        maximum = std::max(maximum, replica.id);
     }
-    return true;
+    if (!valid) {
+        if (add)
+            ++invalid_id_objects_;
+        else
+            --invalid_id_objects_;
+    }
+    if (add) {
+        ++live_max_ids_[maximum];
+    } else {
+        auto it = live_max_ids_.find(maximum);
+        if (--it->second == 0) live_max_ids_.erase(it);
+    }
+}
+
+void StandbyMetadataStore::TrackChanges() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    changed_objects_.clear();
+    track_changes_ = true;
+}
+
+std::set<StandbyMetadataStore::ObjectKey>
+StandbyMetadataStore::TakeChangedObjects() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return std::exchange(changed_objects_, {});
+}
+
+uint64_t StandbyMetadataStore::WeightRevision() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return weight_revision_;
 }
 
 bool StandbyMetadataStore::DrainChunk(size_t count,
@@ -281,6 +336,10 @@ bool StandbyMetadataStore::DrainChunk(size_t count,
     while (!store_.empty() && out.size() < count) {
         auto tenant = store_.begin();
         auto object = tenant->second.extract(tenant->second.begin());
+        AccountReplicaIds(object.mapped(), false);
+        --key_count_;
+        if (track_changes_)
+            changed_objects_.emplace(tenant->first, object.key());
         out.push_back({tenant->first, std::move(object.key()),
                        std::move(object.mapped())});
         if (tenant->second.empty()) {

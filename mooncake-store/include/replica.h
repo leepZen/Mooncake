@@ -345,6 +345,8 @@ struct LocalDiskDescriptor {
 };
 
 class Replica {
+    friend class PreparedStandbyState;
+
    public:
     struct Descriptor;
 

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <stdexcept>
 #include <string_view>
 #include <type_traits>
 
@@ -81,8 +82,13 @@ auto WithWriteTenant(std::string_view raw, bool enable_multi_tenants, Fn&& fn) {
 WrappedMasterService::WrappedMasterService(
     const WrappedMasterServiceConfig& config,
     HttpMetadataServer* http_metadata_server,
-    const std::string& http_metadata_remote_url)
-    : master_service_(MasterServiceConfig(config)) {
+    const std::string& http_metadata_remote_url,
+    std::shared_ptr<MasterService> prepared_service)
+    : owned_master_service_(
+          prepared_service
+              ? std::move(prepared_service)
+              : std::make_shared<MasterService>(MasterServiceConfig(config))),
+      master_service_(*owned_master_service_) {
     // Configure metadata cleanup on client timeout. Prefer the co-located
     // in-process server; otherwise fall back to a separately-deployed HTTP
     // metadata server derived from the cluster configuration.
@@ -94,6 +100,12 @@ WrappedMasterService::WrappedMasterService(
 }
 
 WrappedMasterService::~WrappedMasterService() = default;
+
+void WrappedMasterService::CheckRpcReady() const {
+    if (!master_service_.IsRuntimeServing()) {
+        throw std::runtime_error("Master runtime is awaiting promotion");
+    }
+}
 
 void WrappedMasterService::SetBatchOpLogTerminalCallback(
     OrderedOpLogWriter::TerminalCallback callback) {
@@ -1563,6 +1575,8 @@ WrappedMasterService::GetStorageConfig() {
 
 tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
     const UUID& client_id) {
+    if (!master_service_.IsRuntimeServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     ScopedVLogTimer timer(1, "Ping");
     timer.LogRequest("client_id=", client_id);
 
@@ -1575,6 +1589,8 @@ tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
 }
 
 tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
+    if (!master_service_.IsRuntimeServing())
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     return GetMooncakeStoreVersion();
 }
 
@@ -1895,6 +1911,12 @@ void RegisterPooledHandlers(coro_rpc::coro_rpc_server& server,
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,
                         WrappedMasterService& wrapped_master_service,
                         RpcWorkerPool* worker_pool) {
+    if (!worker_pool &&
+        !wrapped_master_service.master_service_.IsRuntimeServing()) {
+        wrapped_master_service.preparation_worker_pool_ =
+            std::make_unique<RpcWorkerPool>(1);
+        worker_pool = wrapped_master_service.preparation_worker_pool_.get();
+    }
     server.register_handler<&WrappedMasterService::Ping,
                             &WrappedMasterService::ServiceReady>(
         &wrapped_master_service);

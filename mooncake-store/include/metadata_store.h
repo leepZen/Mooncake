@@ -149,11 +149,13 @@ class StandbySegmentRegistry {
     std::optional<StandbySegmentInfo> GetSegment(
         const std::string& transport_endpoint) const;
     std::vector<StandbySegmentInfo> GetAllSegments() const;
+    uint64_t Revision() const;
     void Clear();
 
    private:
     mutable std::shared_mutex mutex_;
     std::unordered_map<std::string, StandbySegmentInfo> segments_by_endpoint_;
+    uint64_t revision_{0};
 };
 
 /**

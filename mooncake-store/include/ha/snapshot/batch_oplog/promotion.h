@@ -11,6 +11,7 @@
 #include "types.h"
 
 namespace mooncake {
+class PreparedStandbyState;
 
 inline constexpr size_t kDefaultBatchOpLogPromotionChunkObjects = 1'000'000;
 
@@ -20,6 +21,7 @@ struct BatchOpLogPromotionHandoff {
     DurablePrefix applied_cursor;
     ViewVersionId producer_view_version{0};
     ReplicaID max_replica_id{0};
+    std::shared_ptr<PreparedStandbyState> prepared_state;
 };
 
 }  // namespace mooncake

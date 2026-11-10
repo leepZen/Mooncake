@@ -14,6 +14,7 @@
 #include "ha/snapshot/batch_oplog/metadata.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "hot_standby_service.h"
+#include "ha/prepared_standby_state.h"
 
 namespace mooncake {
 namespace ha {
@@ -215,9 +216,23 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             return dependency_init_error_;
         }
 
-        ErrorCode err = standby_service_->Start(
-            observed_leader.has_value() ? observed_leader->leader_address : "",
-            oplog_connstring_, config_.cluster_id);
+        ErrorCode err;
+        try {
+            // Required serving configuration is needed only when the runtime
+            // starts, not while selecting a controller or testing its backend.
+            if (capabilities_.has_oplog_following) {
+                standby_service_->SetPreparationConfig(MasterServiceConfig(
+                    WrappedMasterServiceConfig(config_, 0)));
+            }
+            err = standby_service_->Start(
+                observed_leader.has_value() ? observed_leader->leader_address
+                                            : "",
+                oplog_connstring_, config_.cluster_id);
+        } catch (const std::exception& error) {
+            LOG(ERROR) << "Invalid standby preparation configuration: "
+                       << error.what();
+            err = ErrorCode::INVALID_PARAMS;
+        }
 
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
@@ -338,6 +353,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             ctx.applied_cursor = handoff->applied_cursor;
             ctx.producer_view_version = handoff->producer_view_version;
             ctx.max_replica_id = handoff->max_replica_id;
+            ctx.prepared_state = std::move(handoff->prepared_state);
             if (batch_oplog_snapshot_coordinator_) {
                 batch_oplog_snapshot_coordinator_->Stop();
             }
@@ -406,7 +422,8 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         }
         return standby_service_->PreservePromotionBaseline(
             std::move(context.metadata_store), context.applied_cursor,
-            context.producer_view_version, std::move(context.segments));
+            context.producer_view_version, std::move(context.segments),
+            std::move(context.prepared_state));
     }
 
     void SetStandbyRuntimeStateCallback(
