@@ -16,6 +16,8 @@ DEFINE_uint64(chunk_objects, 1000, "Objects drained per chunk");
 DEFINE_bool(prepared, true,
             "Measure prepared runtime instead of legacy restore");
 DEFINE_uint64(tail_objects, 1, "Objects replaced after initial preparation");
+DEFINE_bool(memory_remount, false,
+            "Measure remount of a prepared memory segment");
 
 namespace {
 
@@ -42,19 +44,37 @@ int main(int argc, char** argv) {
     if (FLAGS_objects == 0 || FLAGS_chunk_objects == 0 ||
         FLAGS_objects == std::numeric_limits<uint64_t>::max() ||
         FLAGS_chunk_objects > std::numeric_limits<size_t>::max() ||
-        FLAGS_tail_objects > FLAGS_objects) {
+        FLAGS_tail_objects > FLAGS_objects ||
+        (FLAGS_memory_remount &&
+         (!FLAGS_prepared ||
+          FLAGS_objects >
+              (std::numeric_limits<uintptr_t>::max() - 0x100000000ULL) / 64))) {
         std::cerr << "objects and chunk_objects must be non-zero\n";
         return 1;
     }
 
+    mooncake::Segment memory_segment;
+    memory_segment.id = {1, 2};
+    memory_segment.name = memory_segment.te_endpoint = "bench-memory";
+    memory_segment.base = 0x100000000ULL;
+    memory_segment.size = FLAGS_objects * 64;
+    memory_segment.protocol = "tcp";
     auto source_store = std::make_unique<mooncake::StandbyMetadataStore>();
     for (uint64_t i = 0; i < FLAGS_objects; ++i) {
         mooncake::StandbyObjectMetadata metadata;
-        metadata.size = 1;
+        metadata.size = FLAGS_memory_remount ? 64 : 1;
         mooncake::Replica::Descriptor replica;
         replica.id = i + 1;
         replica.status = mooncake::ReplicaStatus::COMPLETE;
-        replica.descriptor_variant = mooncake::DiskDescriptor{"bench", 1};
+        if (FLAGS_memory_remount) {
+            mooncake::MemoryDescriptor descriptor;
+            descriptor.buffer_descriptor = {64, memory_segment.base + i * 64,
+                                            "tcp", memory_segment.te_endpoint};
+            descriptor.segment_id = memory_segment.id;
+            replica.descriptor_variant = std::move(descriptor);
+        } else {
+            replica.descriptor_variant = mooncake::DiskDescriptor{"bench", 1};
+        }
         metadata.replicas.push_back(std::move(replica));
         if (!source_store->PutMetadata("default", "bench-" + std::to_string(i),
                                        metadata)) {
@@ -74,6 +94,16 @@ int main(int argc, char** argv) {
                           .build();
         mooncake::PreparedStandbyState prepared(config);
         mooncake::StandbySegmentRegistry segments;
+        if (FLAGS_memory_remount) {
+            mooncake::StandbySegmentInfo info;
+            info.segment_name = memory_segment.name;
+            info.transport_endpoint = memory_segment.te_endpoint;
+            info.capacity = memory_segment.size;
+            info.is_memory_segment = true;
+            info.memory =
+                mooncake::MemorySegmentOp{memory_segment, mooncake::UUID(3, 4)};
+            segments.OnSegmentMount(info);
+        }
         const auto start = Clock::now();
         auto error = prepared.Bootstrap(*source_store, segments, {1, 1},
                                         FLAGS_chunk_objects);
@@ -96,12 +126,24 @@ int main(int argc, char** argv) {
         if (error != mooncake::ErrorCode::OK) return 1;
         prepared.Service()->ActivatePreparedRuntime();
         const auto activated = Clock::now();
+        int64_t remount_us = 0;
+        if (FLAGS_memory_remount) {
+            const auto before_remount = Clock::now();
+            if (!prepared.Service()->ReMountSegment({memory_segment},
+                                                    mooncake::UUID(3, 4)))
+                return 1;
+            remount_us = micros(before_remount, Clock::now());
+            if (!prepared.Service()->GetReplicaList(
+                    "bench-0", mooncake::TenantId::Default()))
+                return 1;
+        }
         std::cout << "objects=" << FLAGS_objects
                   << " tail_objects=" << FLAGS_tail_objects
                   << " prepare_us=" << micros(start, bootstrapped)
                   << " tail_us=" << micros(tail_start, synchronized)
                   << " bind_us=" << micros(synchronized, bound)
                   << " activate_us=" << micros(bound, activated)
+                  << " memory_remount_us=" << remount_us
                   << " reconstructed_objects=" << prepared.PreparedObjects()
                   << " peak_rss_bytes=" << PeakRssBytes() << '\n';
         return 0;

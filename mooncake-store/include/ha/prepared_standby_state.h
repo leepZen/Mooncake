@@ -51,10 +51,14 @@ class PreparedStandbyState {
     ErrorCode RebuildNoF(const std::string& endpoint);
     ErrorCode Finish(StandbyMetadataStore& metadata, DurablePrefix cursor);
     ErrorCode PersistRepairs();
+    std::shared_ptr<ClientLivenessRecord> RetainOwner(const UUID& owner);
+    void ReleaseOwner(const UUID& owner);
 
     std::shared_ptr<MasterService> service_;
     std::map<std::string, StandbySegmentInfo> segments_;
     std::unordered_map<std::string, std::string> aliases_;
+    std::map<UUID, std::string> memory_by_id_;
+    std::unordered_map<std::string, std::vector<std::string>> memory_by_alias_;
     std::unordered_map<std::string, std::set<Key>> members_;
     std::map<Key, std::set<std::string>> object_endpoints_;
     std::map<UUID, size_t> owner_refs_;
@@ -69,5 +73,7 @@ class PreparedStandbyState {
     DurablePrefix cursor_;
     bool ready_{false};
     bool bound_{false};
+    // Keep replaced resources alive until all affected buffers are erased.
+    std::vector<std::shared_ptr<void>> retired_memory_segments_;
 };
 }  // namespace mooncake

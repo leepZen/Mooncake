@@ -25,13 +25,18 @@ class SegmentAllocatorRegistration {
     [[nodiscard]] bool OwnsBuffer(const AllocatedBuffer& buffer) const;
     void SetAllocatable(bool allocatable);
     void Invalidate();
+    void SetAvailable(bool available);
     std::shared_ptr<BufferAllocatorBase> allocator_;
     SegmentLifetime allocation_lifetime_;
     SegmentLifetime buffer_lifetime_;
+    SegmentLifetime read_lifetime_;
     std::shared_ptr<ClientLivenessRecord> client_liveness_;
+    UUID segment_id_{0, 0};
     friend class AllocatorManager;
     friend class ScopedNoFSegmentAccess;
     friend class ScopedSegmentAccess;
+    friend class PreparedStandbyState;
+    friend class MasterService;
 };
 
 }  // namespace mooncake

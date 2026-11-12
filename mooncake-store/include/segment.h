@@ -85,7 +85,9 @@ class ScopedSegmentAccess {
      */
     ErrorCode MountSegment(
         const Segment& segment, const UUID& client_id,
-        std::shared_ptr<ClientLivenessRecord> client_liveness);
+        std::shared_ptr<ClientLivenessRecord> client_liveness,
+        std::shared_ptr<SegmentAllocatorRegistration> prepared = nullptr);
+    void ActivatePreparedSegment(const UUID& segment_id);
 
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the

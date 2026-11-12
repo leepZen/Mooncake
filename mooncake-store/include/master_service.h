@@ -2723,6 +2723,14 @@ class MasterService {
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
         standby_allocator_keepalive_;
     std::vector<StandbySegmentInfo> standby_memory_segments_;
+    struct PreparedMemorySegment {
+        MemorySegmentOp metadata;
+        std::shared_ptr<RestoredMemoryAllocator> allocator;
+        std::shared_ptr<SegmentAllocatorRegistration> registration;
+        std::shared_ptr<Lease> remount_lease;
+    };
+    std::map<UUID, std::shared_ptr<PreparedMemorySegment>>
+        prepared_memory_segments_;
     std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
     using StandbyObjectKey = StandbyMetadataStore::ObjectKey;
     std::unordered_map<std::string,

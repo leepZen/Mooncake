@@ -1,4 +1,5 @@
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
+#include <set>
 
 #include <algorithm>
 #include <memory>
@@ -113,9 +114,12 @@ AttemptResult ReadDescriptorObject(SnapshotObjectStore& object_store,
 
 bool ValidateSegments(const std::vector<StandbySegmentInfo>& segments) {
     std::unordered_set<std::string> endpoints;
+    std::set<UUID> memory_ids;
     for (const auto& segment : segments) {
         if (segment.transport_endpoint.empty() ||
-            !endpoints.insert(segment.transport_endpoint).second) {
+            (segment.memory
+                 ? !memory_ids.insert(segment.memory->segment.id).second
+                 : !endpoints.insert(segment.transport_endpoint).second)) {
             return false;
         }
     }

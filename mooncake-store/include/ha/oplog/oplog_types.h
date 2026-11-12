@@ -47,21 +47,33 @@ struct WeightLeaseDeleteOp {
 };
 YLT_REFL(WeightLeaseDeleteOp, lease_id, identity, fenced_metadata_generation);
 
+// The ID identifies the lifetime of the client's memory allocation. A client
+// retaining its data reuses the ID when remounting after a master failover.
+struct MemorySegmentOp {
+    Segment segment;
+    UUID owner_client_id{0, 0};
+    friend bool operator==(const MemorySegmentOp&,
+                           const MemorySegmentOp&) = default;
+};
+YLT_REFL(MemorySegmentOp, segment, owner_client_id);
+
 struct SegmentMountOp {
     std::string segment_name;
     std::string transport_endpoint;
     uint64_t capacity{0};
     bool is_memory_segment{false};
     std::string file_path;
+    struct_pack::compatible<MemorySegmentOp, 1> memory;
 
     YLT_REFL(SegmentMountOp, segment_name, transport_endpoint, capacity,
-             is_memory_segment, file_path);
+             is_memory_segment, file_path, memory);
 };
 
 struct SegmentUnmountOp {
     std::string transport_endpoint;
+    struct_pack::compatible<UUID, 1> memory_segment_id;
 
-    YLT_REFL(SegmentUnmountOp, transport_endpoint);
+    YLT_REFL(SegmentUnmountOp, transport_endpoint, memory_segment_id);
 };
 
 struct SegmentUpdateOp {
@@ -70,9 +82,10 @@ struct SegmentUpdateOp {
     uint64_t capacity{0};
     bool is_memory_segment{false};
     std::string file_path;
+    struct_pack::compatible<MemorySegmentOp, 1> memory;
 
     YLT_REFL(SegmentUpdateOp, segment_name, transport_endpoint, capacity,
-             is_memory_segment, file_path);
+             is_memory_segment, file_path, memory);
 };
 
 // Kept separate from the memory segment payload to preserve its wire format.

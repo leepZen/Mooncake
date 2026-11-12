@@ -8,6 +8,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <algorithm>
+#include <memory>
+#include <vector>
 
 namespace mooncake {
 
@@ -50,16 +53,41 @@ class Lease {
 
     // True when the group has not been read within the TTL at `now`.
     bool IsExpired(const std::chrono::system_clock::time_point now) const {
-        return NowNs(now) >= deadline_ns_.load(std::memory_order_relaxed);
+        return now >= ExpiresAt();
+    }
+
+    // Recovery attaches segment leases before exposing objects. A group lease
+    // shares these dependencies with every member, preserving group protection
+    // when one segment remounts without visiting its individual objects.
+    void AttachRecoveryLease(const std::shared_ptr<Lease>& lease) {
+        if (!lease || lease.get() == this) return;
+        auto current = std::atomic_load(&recovery_leases_);
+        if (current && std::find(current->begin(), current->end(), lease) !=
+                           current->end())
+            return;
+        auto next = std::make_shared<std::vector<std::shared_ptr<Lease>>>(
+            current ? *current : std::vector<std::shared_ptr<Lease>>{});
+        next->push_back(lease);
+        std::atomic_store(
+            &recovery_leases_,
+            std::shared_ptr<const std::vector<std::shared_ptr<Lease>>>(
+                std::move(next)));
+        has_recovery_leases_.store(true, std::memory_order_release);
     }
 
     std::chrono::system_clock::time_point ExpiresAt() const {
         // system_clock is coarser than nanoseconds on some platforms (e.g.
         // microseconds with libc++), so the conversion must be explicit.
-        return std::chrono::system_clock::time_point(
+        auto deadline = std::chrono::system_clock::time_point(
             std::chrono::duration_cast<std::chrono::system_clock::duration>(
                 std::chrono::nanoseconds(
                     deadline_ns_.load(std::memory_order_relaxed))));
+        if (has_recovery_leases_.load(std::memory_order_acquire)) {
+            auto leases = std::atomic_load(&recovery_leases_);
+            for (const auto& lease : *leases)
+                deadline = std::max(deadline, lease->ExpiresAt());
+        }
+        return deadline;
     }
 
    private:
@@ -75,6 +103,8 @@ class Lease {
     }
 
     std::atomic<int64_t> deadline_ns_{0};
+    std::shared_ptr<const std::vector<std::shared_ptr<Lease>>> recovery_leases_;
+    std::atomic<bool> has_recovery_leases_{false};
 };
 
 }  // namespace mooncake

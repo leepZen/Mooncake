@@ -166,7 +166,8 @@ std::optional<UUID> ScopedAllocatorAccess::GetOwnerClientId(
 
 ErrorCode ScopedSegmentAccess::MountSegment(
     const Segment& segment, const UUID& client_id,
-    std::shared_ptr<ClientLivenessRecord> client_liveness) {
+    std::shared_ptr<ClientLivenessRecord> client_liveness,
+    std::shared_ptr<SegmentAllocatorRegistration> prepared) {
     if (segment.locality && segment.locality->numa_node < 0) {
         return ErrorCode::INVALID_PARAMS;
     }
@@ -215,6 +216,14 @@ ErrorCode ScopedSegmentAccess::MountSegment(
     }
     const uintptr_t buffer = segment.base;
     const size_t size = segment.size;
+    if (prepared &&
+        (prepared->segment_id_ != segment.id ||
+         prepared->GetAllocator()->base() != buffer ||
+         prepared->GetAllocator()->capacity() != size ||
+         prepared->GetAllocator()->getSegmentName() != segment.name ||
+         prepared->GetAllocator()->getTransportEndpoint() !=
+             segment.te_endpoint))
+        return ErrorCode::INVALID_PARAMS;
 
     // Check if cxl storage is enable
     if (segment_manager_->enable_cxl_ && segment.protocol == "cxl") {
@@ -229,6 +238,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(
             auto registration =
                 segment_manager_->allocator_manager_.addAllocator(
                     segment.name, allocator, std::move(client_liveness));
+            registration->segment_id_ = segment.id;
             segment_manager_->client_segments_[client_id].push_back(segment.id);
             segment_manager_->mounted_segments_[segment.id] = {
                 segment, SegmentStatus::OK, allocator, registration};
@@ -251,7 +261,8 @@ ErrorCode ScopedSegmentAccess::MountSegment(
         return ErrorCode::INVALID_PARAMS;
     }
 
-    if (segment_manager_->memory_allocator_ == BufferAllocatorType::CACHELIB &&
+    if (!prepared &&
+        segment_manager_->memory_allocator_ == BufferAllocatorType::CACHELIB &&
         (buffer % facebook::cachelib::Slab::kSize ||
          size % facebook::cachelib::Slab::kSize)) {
         LOG(ERROR) << "buffer=" << buffer << " or size=" << size
@@ -261,17 +272,29 @@ ErrorCode ScopedSegmentAccess::MountSegment(
     }
 
     auto created =
-        CreateBufferAllocator(segment_manager_->memory_allocator_, segment.name,
-                              buffer, size, segment.te_endpoint);
+        prepared
+            ? tl::expected<std::shared_ptr<BufferAllocatorBase>, ErrorCode>(
+                  prepared->GetAllocator())
+            : CreateBufferAllocator(segment_manager_->memory_allocator_,
+                                    segment.name, buffer, size,
+                                    segment.te_endpoint);
     if (!created) {
         return created.error();
     }
     auto allocator = std::move(*created);
     allocator->SetLocality(segment.locality);
 
-    allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
-    auto registration = segment_manager_->allocator_manager_.addAllocator(
-        segment.name, allocator, std::move(client_liveness));
+    std::shared_ptr<SegmentAllocatorRegistration> registration;
+    if (prepared) {
+        registration = std::move(prepared);
+        segment_manager_->allocator_manager_.addRegistration(segment.name,
+                                                             registration);
+    } else {
+        allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
+        registration = segment_manager_->allocator_manager_.addAllocator(
+            segment.name, allocator, std::move(client_liveness));
+    }
+    registration->segment_id_ = segment.id;
     segment_manager_->client_segments_[client_id].push_back(segment.id);
     segment_manager_->mounted_segments_[segment.id] = {
         segment, SegmentStatus::OK, std::move(allocator), registration};
@@ -281,6 +304,12 @@ ErrorCode ScopedSegmentAccess::MountSegment(
     MasterMetricManager::instance().inc_total_mem_capacity(segment.name, size);
 
     return ErrorCode::OK;
+}
+
+void ScopedSegmentAccess::ActivatePreparedSegment(const UUID& segment_id) {
+    auto& mounted = segment_manager_->mounted_segments_.at(segment_id);
+    mounted.buf_allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
+    mounted.allocator_registration->SetAvailable(true);
 }
 
 void ScopedSegmentAccess::BindClientLiveness(

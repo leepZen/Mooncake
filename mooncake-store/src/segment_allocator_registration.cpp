@@ -33,8 +33,7 @@ std::unique_ptr<AllocatedBuffer> SegmentAllocatorRegistration::Allocate(
     if (!buffer) {
         return nullptr;
     }
-    buffer->bindSegmentLifetime(buffer_lifetime_);
-    buffer->bindClientLiveness(record);
+    BindBuffer(*buffer);
     if (!allocation_lifetime_.isAvailable() ||
         record != std::atomic_load_explicit(&client_liveness_,
                                             std::memory_order_acquire) ||
@@ -62,6 +61,8 @@ void SegmentAllocatorRegistration::BindClientLiveness(
 }
 
 void SegmentAllocatorRegistration::BindBuffer(AllocatedBuffer& buffer) const {
+    buffer.read_lifetime_ = read_lifetime_;
+    buffer.segment_id_ = segment_id_;
     buffer.bindSegmentLifetime(buffer_lifetime_);
     buffer.bindClientLiveness(std::atomic_load_explicit(
         &client_liveness_, std::memory_order_acquire));
@@ -79,6 +80,15 @@ void SegmentAllocatorRegistration::SetAllocatable(bool allocatable) {
 void SegmentAllocatorRegistration::Invalidate() {
     allocation_lifetime_.setAvailable(false);
     buffer_lifetime_.setAvailable(false);
+    read_lifetime_.setAvailable(false);
+}
+
+void SegmentAllocatorRegistration::SetAvailable(bool available) {
+    allocation_lifetime_.setAvailable(available);
+    // An awaiting-remount buffer still owns valid allocated space. Its shared
+    // read lifetime opens only when this registration's remount commits.
+    buffer_lifetime_.setAvailable(true);
+    read_lifetime_.setAvailable(available);
 }
 
 }  // namespace mooncake

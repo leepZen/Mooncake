@@ -29,6 +29,9 @@ class MasterServiceTestPeer {
     using QuotaEraseMode = MasterService::QuotaEraseMode;
     using TenantQuotaEvictionResult = MasterService::TenantQuotaEvictionResult;
     using TenantState = MasterService::TenantState;
+    static auto& PreparedMemorySegments(MasterService& service) {
+        return service.prepared_memory_segments_;
+    }
 
     static constexpr auto kDynamicReplicationWindowEntryLimit =
         DynamicReplicationController::kWindowEntryLimit;

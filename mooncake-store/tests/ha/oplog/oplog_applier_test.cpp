@@ -689,6 +689,81 @@ TEST_F(OpLogApplierTest, BatchSnapshotReadsLegacySegmentRegistry) {
     ASSERT_EQ(decoded->size(), 1);
     EXPECT_EQ(decoded->front().segment_name, "memory-segment");
     EXPECT_FALSE(decoded->front().nof.has_value());
+    EXPECT_FALSE(decoded->front().memory.has_value());
+}
+
+TEST_F(OpLogApplierTest,
+       MemorySegmentRuntimeIdentitySurvivesReplayAndSnapshot) {
+    SegmentMountOp mount;
+    mount.segment_name = "memory";
+    mount.transport_endpoint = "endpoint";
+    mount.capacity = 4096;
+    mount.is_memory_segment = true;
+    Segment segment;
+    segment.id = {1, 2};
+    segment.name = mount.segment_name;
+    segment.te_endpoint = mount.transport_endpoint;
+    segment.base = 0x100000;
+    segment.size = mount.capacity;
+    segment.protocol = "tcp";
+    mount.memory = MemorySegmentOp{segment, UUID(3, 4)};
+    auto bytes = struct_pack::serialize<std::string>(mount);
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::SEGMENT_MOUNT, "memory", bytes)));
+    auto info = applier_->GetSegmentRegistry().GetSegment("endpoint");
+    ASSERT_TRUE(info);
+    ASSERT_TRUE(info->memory);
+    EXPECT_EQ(*mount.memory, *info->memory);
+    auto decoded = DecodeBatchOpLogSnapshotSegments(
+        EncodeBatchOpLogSnapshotSegments({*info}));
+    ASSERT_TRUE(decoded);
+    ASSERT_TRUE(decoded->front().memory);
+    EXPECT_EQ(*mount.memory, *decoded->front().memory);
+    // Readers without the compatible field can still decode the mount.
+    LegacyStandbySegmentInfo old_reader;
+    ASSERT_EQ(struct_pack::errc::ok,
+              struct_pack::deserialize_to(old_reader, bytes));
+    EXPECT_EQ(mount.capacity, old_reader.capacity);
+    auto old_bytes = struct_pack::serialize<std::string>(old_reader);
+    SegmentMountOp upgraded;
+    ASSERT_EQ(struct_pack::errc::ok,
+              struct_pack::deserialize_to(upgraded, old_bytes));
+    EXPECT_FALSE(upgraded.memory);
+}
+
+TEST_F(OpLogApplierTest, MemoryRegionsSharingEndpointUnmountById) {
+    SegmentMountOp mount;
+    mount.segment_name = mount.transport_endpoint = "shared";
+    mount.capacity = 4096;
+    mount.is_memory_segment = true;
+    Segment region;
+    region.id = {1, 2};
+    region.name = region.te_endpoint = "shared";
+    region.base = 0x100000;
+    region.size = mount.capacity;
+    mount.memory = MemorySegmentOp{region, UUID(3, 4)};
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::SEGMENT_MOUNT, "shared",
+                  struct_pack::serialize<std::string>(mount))));
+    mount.memory->segment.id.second++;
+    mount.memory->segment.base += 4096;
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(2, OpType::SEGMENT_MOUNT, "shared",
+                  struct_pack::serialize<std::string>(mount))));
+    auto all = applier_->GetSegmentRegistry().GetAllSegments();
+    ASSERT_EQ(2u, all.size());
+    auto snapshot =
+        DecodeBatchOpLogSnapshotSegments(EncodeBatchOpLogSnapshotSegments(all));
+    ASSERT_TRUE(snapshot);
+    ASSERT_EQ(2u, snapshot->size());
+    SegmentUnmountOp unmount{"shared"};
+    unmount.memory_segment_id = region.id;
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(3, OpType::SEGMENT_UNMOUNT, "shared",
+                  struct_pack::serialize<std::string>(unmount))));
+    auto remaining = applier_->GetSegmentRegistry().GetAllSegments();
+    ASSERT_EQ(1u, remaining.size());
+    EXPECT_EQ(mount.memory->segment.id, remaining[0].memory->segment.id);
 }
 
 TEST_F(OpLogApplierTest, TestApplySegmentUnmount) {

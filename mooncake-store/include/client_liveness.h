@@ -58,12 +58,18 @@ class ClientLivenessRecord {
         RetainingGuard& operator=(const RetainingGuard&) = delete;
         RetainingGuard(RetainingGuard&&) noexcept = default;
         RetainingGuard& operator=(RetainingGuard&&) noexcept = default;
+        ClientLivenessObservation Observe(TimePoint now) {
+            return record_->CommitObservationLocked(
+                now, record_->state_.load(std::memory_order_relaxed));
+        }
 
        private:
         friend class ClientLivenessRecord;
-        explicit RetainingGuard(std::unique_lock<std::mutex>&& lock)
-            : lock_(std::move(lock)) {}
+        explicit RetainingGuard(ClientLivenessRecord& record,
+                                std::unique_lock<std::mutex>&& lock)
+            : record_(&record), lock_(std::move(lock)) {}
 
+        ClientLivenessRecord* record_;
         std::unique_lock<std::mutex> lock_;
     };
 
@@ -94,7 +100,7 @@ class ClientLivenessRecord {
             ClientLivenessState::OFFLINE) {
             return std::nullopt;
         }
-        return RetainingGuard(std::move(lock));
+        return RetainingGuard(*this, std::move(lock));
     }
 
     [[nodiscard]] ClientLivenessObservation Observe(TimePoint now) {

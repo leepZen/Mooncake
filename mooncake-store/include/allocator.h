@@ -96,6 +96,7 @@ class AllocatedBuffer {
     [[nodiscard]] void* data() const noexcept { return buffer_ptr_; }
 
     [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
+    UUID segment_id() const noexcept { return segment_id_; }
 
     [[nodiscard]] bool isAllocatorValid() const {
         return !allocator_.expired() && segment_lifetime_.isAvailable();
@@ -106,7 +107,7 @@ class AllocatedBuffer {
     }
 
     [[nodiscard]] bool isAvailable() const {
-        if (!isAllocatorValid()) {
+        if (!isAllocatorValid() || !read_lifetime_.isAvailable()) {
             return false;
         }
         const ClientLivenessRecord* record = client_liveness_.get();
@@ -164,6 +165,8 @@ class AllocatedBuffer {
     // (RebuildClientLivenessAfterSnapshotRestore), which runs inside the
     // MasterService constructor, before any reader.
     SegmentLifetime segment_lifetime_;
+    SegmentLifetime read_lifetime_;
+    UUID segment_id_{0, 0};
     std::shared_ptr<ClientLivenessRecord> client_liveness_;
     std::string segment_name_;
     void* buffer_ptr_{nullptr};
@@ -280,6 +283,31 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
    private:
     std::string segment_name_;
     std::string transport_endpoint_;
+};
+
+// A recovered memory segment keeps its address-space allocator across replay
+// and remount. Reservations and frees update ordered intervals incrementally.
+// This allocator owns metadata only; the bytes remain in the client's region.
+class RestoredMemoryAllocator final
+    : public BufferAllocatorBase,
+      public std::enable_shared_from_this<RestoredMemoryAllocator> {
+   public:
+    explicit RestoredMemoryAllocator(const Segment& segment);
+    ~RestoredMemoryAllocator() override;
+    std::unique_ptr<AllocatedBuffer> ReserveAt(
+        const AllocatedBuffer::Descriptor& descriptor);
+    std::unique_ptr<AllocatedBuffer> allocate(size_t size) override;
+    void deallocate(AllocatedBuffer* buffer) override;
+    size_t capacity() const override;
+    size_t size() const override { return GetUsageBytes(); }
+    uintptr_t base() const override;
+    std::string getSegmentName() const override;
+    std::string getTransportEndpoint() const override;
+    size_t getLargestFreeRegion() const override;
+
+   private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 /**

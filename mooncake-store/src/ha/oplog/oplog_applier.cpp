@@ -407,6 +407,7 @@ bool OpLogApplier::ApplySegmentMount(const OpLogEntry& entry) {
     info.capacity = op.capacity;
     info.is_memory_segment = op.is_memory_segment;
     info.file_path = op.file_path;
+    info.memory = op.memory;
     segment_registry_.OnSegmentMount(info);
     return true;
 }
@@ -419,7 +420,10 @@ bool OpLogApplier::ApplySegmentUnmount(const OpLogEntry& entry) {
                    << entry.object_key;
         return false;
     }
-    segment_registry_.OnSegmentUnmount(op.transport_endpoint);
+    segment_registry_.OnSegmentUnmount(
+        op.transport_endpoint, op.memory_segment_id
+                                   ? std::optional<UUID>(*op.memory_segment_id)
+                                   : std::nullopt);
     return true;
 }
 
@@ -437,6 +441,7 @@ bool OpLogApplier::ApplySegmentUpdate(const OpLogEntry& entry) {
     info.capacity = op.capacity;
     info.is_memory_segment = op.is_memory_segment;
     info.file_path = op.file_path;
+    info.memory = op.memory;
     segment_registry_.OnSegmentUpdate(info);
     return true;
 }

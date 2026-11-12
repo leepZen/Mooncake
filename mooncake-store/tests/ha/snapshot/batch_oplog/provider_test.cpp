@@ -211,7 +211,21 @@ TEST_F(BatchOpLogSnapshotProviderTest, UsesFallbackWhenLatestIsCorrupt) {
     const std::string snapshot_id = "0-7";
     const std::string segments_key =
         ha::BuildBatchOpLogSnapshotSegmentsKey("snapshots", snapshot_id);
-    const auto segments = EncodeBatchOpLogSnapshotSegments({});
+    StandbySegmentInfo first;
+    first.segment_name = first.transport_endpoint = "shared-memory";
+    first.is_memory_segment = true;
+    first.capacity = 4096;
+    Segment region;
+    region.id = {1, 2};
+    region.name = region.te_endpoint = first.transport_endpoint;
+    region.base = 0x100000;
+    region.size = first.capacity;
+    region.protocol = "tcp";
+    first.memory = MemorySegmentOp{region, UUID(3, 4)};
+    auto second = first;
+    second.memory->segment.id.second++;
+    second.memory->segment.base += region.size;
+    const auto segments = EncodeBatchOpLogSnapshotSegments({first, second});
     ASSERT_TRUE(object_store.UploadBuffer(segments_key, segments));
     ha::BatchOpLogSnapshotManifest manifest;
     manifest.snapshot_id = snapshot_id;
@@ -252,6 +266,12 @@ TEST_F(BatchOpLogSnapshotProviderTest, UsesFallbackWhenLatestIsCorrupt) {
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(0u, result->last_included_seq);
     EXPECT_EQ(0u, metadata.GetKeyCount());
+    const auto restored = registry.GetAllSegments();
+    ASSERT_EQ(2u, restored.size());
+    ASSERT_TRUE(restored[0].memory);
+    ASSERT_TRUE(restored[1].memory);
+    EXPECT_EQ(*first.memory, *restored[0].memory);
+    EXPECT_EQ(*second.memory, *restored[1].memory);
 }
 
 TEST_F(BatchOpLogSnapshotProviderTest, ReturnsFinalCursorAfterSuffixReplay) {

@@ -323,7 +323,8 @@ struct DfsReplicaData {
 struct MemoryDescriptor {
     AllocatedBuffer::Descriptor buffer_descriptor;
     struct_pack::compatible<SegmentLocality, 1> locality;
-    YLT_REFL(MemoryDescriptor, buffer_descriptor, locality);
+    struct_pack::compatible<UUID, 2> segment_id;
+    YLT_REFL(MemoryDescriptor, buffer_descriptor, locality, segment_id);
 };
 
 struct NoFDescriptor {
@@ -934,6 +935,8 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         const auto& mem_data = std::get<MemoryReplicaData>(data_);
         auto& mem_desc = desc.get_memory_descriptor();
         if (mem_data.buffer) {
+            if (mem_data.buffer->segment_id() != UUID{0, 0})
+                mem_desc.segment_id = mem_data.buffer->segment_id();
             mem_desc.buffer_descriptor =
                 mem_data.buffer->get_descriptor(&mem_desc.locality);
         } else {

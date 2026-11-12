@@ -8,6 +8,8 @@
 #include <memory>
 #include <numeric>
 #include <stdexcept>
+#include <map>
+#include <mutex>
 
 #include "master_metric_manager.h"
 
@@ -31,6 +33,143 @@ bool IsValidAllocation(const LiveAllocation& allocation,
 }
 
 }  // namespace
+
+struct RestoredMemoryAllocator::Impl {
+    static constexpr size_t kAlignment = 64;
+    using SizeIndex = std::multimap<size_t, uintptr_t>;
+    struct FreeRange {
+        size_t length;
+        SizeIndex::iterator size_entry;
+    };
+    struct Allocation {
+        size_t requested;
+        size_t occupied;
+    };
+    explicit Impl(const Segment& value) : segment(value) {
+        if (segment.base == 0 || segment.size == 0 ||
+            segment.base > std::numeric_limits<uintptr_t>::max() - segment.size)
+            throw std::invalid_argument("Invalid restored memory region");
+        AddFree(segment.base, segment.size);
+    }
+    void AddFree(uintptr_t address, size_t length) {
+        if (length == 0) return;
+        const auto padding = (kAlignment - address % kAlignment) % kAlignment;
+        const auto usable = length >= padding ? length - padding : 0;
+        auto entry = by_size.emplace(usable / kAlignment * kAlignment, address);
+        free.emplace(address, FreeRange{length, entry});
+    }
+    void EraseFree(std::map<uintptr_t, FreeRange>::iterator it) {
+        by_size.erase(it->second.size_entry);
+        free.erase(it);
+    }
+    bool Reserve(uintptr_t address, size_t requested, size_t occupied) {
+        if (requested == 0 || occupied < requested || address < segment.base ||
+            address - segment.base >= segment.size ||
+            occupied > segment.size - (address - segment.base))
+            return false;
+        auto next = free.upper_bound(address);
+        if (next == free.begin()) return false;
+        auto range = std::prev(next);
+        const auto begin = range->first;
+        const auto end = begin + range->second.length;
+        if (address > end || occupied > end - address) return false;
+        live.emplace(address, Allocation{requested, occupied});
+        EraseFree(range);
+        AddFree(begin, address - begin);
+        AddFree(address + occupied, end - address - occupied);
+        return true;
+    }
+    Segment segment;
+    mutable std::mutex mutex;
+    std::map<uintptr_t, FreeRange> free;
+    SizeIndex by_size;
+    std::map<uintptr_t, Allocation> live;
+};
+
+RestoredMemoryAllocator::RestoredMemoryAllocator(const Segment& segment)
+    : impl_(std::make_unique<Impl>(segment)) {}
+
+RestoredMemoryAllocator::~RestoredMemoryAllocator() {
+    MasterMetricManager::instance().dec_allocated_mem_size(getSegmentName(),
+                                                           size());
+}
+
+std::unique_ptr<AllocatedBuffer> RestoredMemoryAllocator::ReserveAt(
+    const AllocatedBuffer::Descriptor& descriptor) {
+    if (descriptor.transport_endpoint_ != impl_->segment.te_endpoint ||
+        descriptor.protocol_ == "cxl")
+        return nullptr;
+    std::lock_guard lock(impl_->mutex);
+    if (!impl_->Reserve(descriptor.buffer_address_, descriptor.size_,
+                        descriptor.size_))
+        return nullptr;
+    RecordAllocation(descriptor.size_);
+    MasterMetricManager::instance().inc_allocated_mem_size(getSegmentName(),
+                                                           descriptor.size_);
+    return std::make_unique<AllocatedBuffer>(shared_from_this(), descriptor);
+}
+
+std::unique_ptr<AllocatedBuffer> RestoredMemoryAllocator::allocate(
+    size_t size) {
+    constexpr size_t alignment = Impl::kAlignment;
+    if (size == 0 || size > std::numeric_limits<size_t>::max() - alignment + 1)
+        return nullptr;
+    const auto occupied = (size + alignment - 1) / alignment * alignment;
+    std::lock_guard lock(impl_->mutex);
+    auto candidate = impl_->by_size.lower_bound(occupied);
+    if (candidate == impl_->by_size.end()) return nullptr;
+    const auto begin = candidate->second;
+    const auto padding = (alignment - begin % alignment) % alignment;
+    const auto address = begin + padding;
+    if (!impl_->Reserve(address, size, occupied)) return nullptr;
+    RecordAllocation(size);
+    MasterMetricManager::instance().inc_allocated_mem_size(getSegmentName(),
+                                                           size);
+    return std::make_unique<AllocatedBuffer>(
+        shared_from_this(), reinterpret_cast<void*>(address), size);
+}
+
+void RestoredMemoryAllocator::deallocate(AllocatedBuffer* buffer) {
+    std::lock_guard lock(impl_->mutex);
+    const auto address = reinterpret_cast<uintptr_t>(buffer->data());
+    auto allocation = impl_->live.find(address);
+    if (allocation == impl_->live.end() ||
+        allocation->second.requested != buffer->size())
+        return;
+    uintptr_t begin = address;
+    size_t length = allocation->second.occupied;
+    impl_->live.erase(allocation);
+    auto right = impl_->free.lower_bound(begin);
+    if (right != impl_->free.begin()) {
+        auto left = std::prev(right);
+        if (left->first + left->second.length == begin) {
+            begin = left->first;
+            length += left->second.length;
+            impl_->EraseFree(left);
+        }
+    }
+    if (right != impl_->free.end() && begin + length == right->first) {
+        length += right->second.length;
+        impl_->EraseFree(right);
+    }
+    impl_->AddFree(begin, length);
+    RecordDeallocation(buffer->size());
+    MasterMetricManager::instance().dec_allocated_mem_size(getSegmentName(),
+                                                           buffer->size());
+}
+
+size_t RestoredMemoryAllocator::capacity() const { return impl_->segment.size; }
+uintptr_t RestoredMemoryAllocator::base() const { return impl_->segment.base; }
+std::string RestoredMemoryAllocator::getSegmentName() const {
+    return impl_->segment.name;
+}
+std::string RestoredMemoryAllocator::getTransportEndpoint() const {
+    return impl_->segment.te_endpoint;
+}
+size_t RestoredMemoryAllocator::getLargestFreeRegion() const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->by_size.empty() ? 0 : impl_->by_size.rbegin()->first;
+}
 
 void BufferAllocatorBase::AttachUsageTracker(
     const std::shared_ptr<StorageUsageTracker>& usage_tracker) {

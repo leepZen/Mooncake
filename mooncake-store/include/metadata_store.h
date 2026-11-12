@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <map>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -63,9 +64,10 @@ struct StandbySegmentInfo {
     std::string file_path;  // empty for memory segments
     // Versioned so existing batch snapshots remain readable.
     struct_pack::compatible<NoFSegmentOp, 1> nof;
+    struct_pack::compatible<MemorySegmentOp, 2> memory;
 
     YLT_REFL(StandbySegmentInfo, segment_name, transport_endpoint, capacity,
-             is_memory_segment, file_path, nof);
+             is_memory_segment, file_path, nof, memory);
 };
 
 /**
@@ -141,7 +143,8 @@ class StandbySegmentRegistry {
 
     // Segment lifecycle events
     void OnSegmentMount(const StandbySegmentInfo& info);
-    void OnSegmentUnmount(const std::string& transport_endpoint);
+    void OnSegmentUnmount(const std::string& transport_endpoint,
+                          std::optional<UUID> memory_segment_id = std::nullopt);
     void OnSegmentUpdate(const StandbySegmentInfo& info);
 
     // Queries
@@ -155,6 +158,7 @@ class StandbySegmentRegistry {
    private:
     mutable std::shared_mutex mutex_;
     std::unordered_map<std::string, StandbySegmentInfo> segments_by_endpoint_;
+    std::map<UUID, StandbySegmentInfo> memory_segments_;
     uint64_t revision_{0};
 };
 

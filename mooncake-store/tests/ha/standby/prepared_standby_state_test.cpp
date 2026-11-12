@@ -37,6 +37,27 @@ StandbyObjectMetadata MemoryObject(uint64_t id, uintptr_t address,
     return metadata;
 }
 
+StandbySegmentInfo PreparedMemorySegment(const std::string& endpoint = "memory",
+                                         uintptr_t base = 0x100000000) {
+    auto info = MemorySegment(endpoint);
+    Segment segment;
+    segment.id = {base, 4};
+    segment.name = segment.te_endpoint = endpoint;
+    segment.base = base;
+    segment.size = info.capacity;
+    segment.protocol = "tcp";
+    info.memory = MemorySegmentOp{segment, UUID(5, 6)};
+    return info;
+}
+
+StandbyObjectMetadata PreparedMemoryObject(uint64_t id, uintptr_t address,
+                                           const StandbySegmentInfo& info) {
+    auto metadata = MemoryObject(id, address, info.transport_endpoint);
+    std::get<MemoryDescriptor>(metadata.replicas[0].descriptor_variant)
+        .segment_id = info.memory->segment.id;
+    return metadata;
+}
+
 MasterServiceConfig Config() {
     auto config = MasterServiceConfig::builder().set_enable_ha(false).build();
     config.root_fs_dir.clear();
@@ -151,6 +172,216 @@ TEST(PreparedStandbyStateTest, SegmentChangeRebuildsOnlyItsMembers) {
     ASSERT_EQ(ErrorCode::OK, prepared.Synchronize(store, registry, {3, 4}));
     EXPECT_EQ(4u, prepared.PreparedObjects());
     EXPECT_TRUE(Published(*prepared.Service(), "first-key"));
+}
+
+TEST(PreparedStandbyStateTest,
+     MemoryRemountAdoptsContinuouslyUpdatedAllocator) {
+    for (const auto backend :
+         {BufferAllocatorType::OFFSET, BufferAllocatorType::CACHELIB}) {
+        auto config = Config();
+        config.memory_allocator = backend;
+        PreparedStandbyState prepared(config);
+        StandbyMetadataStore store;
+        StandbySegmentRegistry registry;
+        auto info = PreparedMemorySegment();
+        registry.OnSegmentMount(info);
+        for (uint64_t i = 0; i < 2000; ++i)
+            store.PutMetadata(
+                "default", std::to_string(i),
+                PreparedMemoryObject(
+                    i + 1, info.memory->segment.base + i * 1024, info));
+        ASSERT_EQ(ErrorCode::OK,
+                  prepared.Bootstrap(store, registry, {1, 2000}, 17));
+        auto service = prepared.Service();
+        auto allocator = MasterServiceTestPeer::PreparedMemorySegments(*service)
+                             .at(info.memory->segment.id)
+                             ->allocator;
+        EXPECT_EQ(2000 * 1024u, allocator->size());
+        const ObjectMetadata* unchanged;
+        {
+            MasterServiceTestPeer::MetadataAccessorRO object(
+                service.get(), {TenantId::Default(), "1500"});
+            unchanged = &object.Get();
+        }
+        store.Remove("default", "0");
+        store.PutMetadata(
+            "default", "replacement",
+            PreparedMemoryObject(3000, info.memory->segment.base, info));
+        ASSERT_EQ(ErrorCode::OK,
+                  prepared.Synchronize(store, registry, {2, 2002}));
+        EXPECT_EQ(2001u, prepared.PreparedObjects());
+        EXPECT_EQ(allocator,
+                  MasterServiceTestPeer::PreparedMemorySegments(*service)
+                      .at(info.memory->segment.id)
+                      ->allocator);
+        EXPECT_EQ(2000 * 1024u, allocator->size());
+        config.view_version = 7;
+        ASSERT_EQ(ErrorCode::OK, prepared.BindTerm(config));
+        prepared.AbortTerm();
+        config.view_version = 8;
+        ASSERT_EQ(ErrorCode::OK, prepared.BindTerm(config));
+        EXPECT_FALSE(service->GetReplicaList("1500", TenantId::Default()));
+        // Exercise the ordinary mount entry too: it must adopt reservations.
+        ASSERT_TRUE(service->MountSegment(info.memory->segment,
+                                          info.memory->owner_client_id));
+        EXPECT_TRUE(
+            MasterServiceTestPeer::PreparedMemorySegments(*service).empty());
+        {
+            auto access = MasterServiceTestPeer::SegmentManager(*service)
+                              .getSegmentAccess();
+            EXPECT_EQ(allocator, access.GetAllocator(info.memory->segment.id));
+        }
+        {
+            MasterServiceTestPeer::MetadataAccessorRO object(
+                service.get(), {TenantId::Default(), "1500"});
+            EXPECT_EQ(unchanged, &object.Get());
+            EXPECT_FALSE(
+                object.Get().GetAllReplicas()[0].has_invalid_mem_handle());
+        }
+        auto replicas = service->GetReplicaList("1500", TenantId::Default());
+        ASSERT_TRUE(replicas);
+        EXPECT_EQ(info.memory->segment.id,
+                  *replicas->replicas[0].get_memory_descriptor().segment_id);
+        auto allocation = service->PutStart(
+            UUID(5, 6), "new", TenantId::Default(), 1024, ReplicateConfig{});
+        ASSERT_TRUE(allocation);
+        EXPECT_GE(allocation->front()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.buffer_address_,
+                  info.memory->segment.base + 2000 * 1024);
+        EXPECT_EQ(2001u, prepared.PreparedObjects());
+    }
+}
+
+TEST(PreparedStandbyStateTest,
+     PreparedMemoryRemountRejectsWrongIdentityAndCanRetry) {
+    PreparedStandbyState prepared(Config());
+    StandbyMetadataStore store;
+    StandbySegmentRegistry registry;
+    auto info = PreparedMemorySegment();
+    registry.OnSegmentMount(info);
+    store.PutMetadata("default", "key",
+                      PreparedMemoryObject(1, info.memory->segment.base, info));
+    ASSERT_EQ(ErrorCode::OK, prepared.Bootstrap(store, registry, {1, 1}, 1));
+    auto service = prepared.Service();
+    auto wrong = info.memory->segment;
+    wrong.base += 1024;
+    EXPECT_FALSE(service->ReMountSegment({wrong}, UUID(5, 6)));
+    wrong = info.memory->segment;
+    wrong.id.second++;
+    EXPECT_FALSE(service->ReMountSegment({wrong}, UUID(5, 6)));
+    EXPECT_FALSE(service->ReMountSegment({info.memory->segment}, UUID(7, 8)));
+    EXPECT_FALSE(service->GetReplicaList("key", TenantId::Default()));
+    auto owner = MasterServiceTestPeer::ClientLivenessRecords(*service).at(
+        info.memory->owner_client_id);
+    ASSERT_EQ(
+        ClientLivenessTransition::BECAME_SUSPECTED,
+        owner->Evaluate(ClientLivenessRecord::Clock::now(),
+                        std::chrono::milliseconds(0), std::chrono::hours(1)));
+    ASSERT_TRUE(service->ReMountSegment({info.memory->segment}, UUID(5, 6)));
+    EXPECT_TRUE(owner->IsServing());
+    ASSERT_TRUE(service->ReMountSegment({info.memory->segment}, UUID(5, 6)));
+    EXPECT_TRUE(service->GetReplicaList("key", TenantId::Default()));
+}
+
+TEST(PreparedStandbyStateTest, PreparedRemountUsesRecoveredAllocatorGeometry) {
+    auto config = Config();
+    config.memory_allocator = BufferAllocatorType::CACHELIB;
+    PreparedStandbyState prepared(config);
+    StandbyMetadataStore store;
+    StandbySegmentRegistry registry;
+    auto info = PreparedMemorySegment("unaligned", 0x100000003);
+    registry.OnSegmentMount(info);
+    store.PutMetadata("default", "key",
+                      PreparedMemoryObject(1, info.memory->segment.base, info));
+    ASSERT_EQ(ErrorCode::OK, prepared.Bootstrap(store, registry, {1, 1}, 1));
+    ASSERT_TRUE(
+        prepared.Service()->ReMountSegment({info.memory->segment}, UUID(5, 6)));
+    EXPECT_TRUE(prepared.Service()->GetReplicaList("key", TenantId::Default()));
+}
+
+TEST(PreparedStandbyStateTest,
+     PartialRemountProtectsWholeGroupAndAllowsRemainingSegments) {
+    PreparedStandbyState prepared(Config());
+    StandbyMetadataStore store;
+    StandbySegmentRegistry registry;
+    auto first = PreparedMemorySegment("first");
+    auto second = PreparedMemorySegment("second", 0x200000000);
+    registry.OnSegmentMount(first);
+    registry.OnSegmentMount(second);
+    auto a = PreparedMemoryObject(1, first.memory->segment.base, first);
+    auto b = PreparedMemoryObject(2, second.memory->segment.base, second);
+    a.group_id = b.group_id = "group";
+    store.PutMetadata("default", "a", a);
+    store.PutMetadata("default", "b", b);
+    ASSERT_EQ(ErrorCode::OK, prepared.Bootstrap(store, registry, {1, 2}, 1));
+    auto service = prepared.Service();
+    ASSERT_TRUE(service->ReMountSegment({first.memory->segment}, UUID(5, 6)));
+    EXPECT_TRUE(service->GetReplicaList("a", TenantId::Default()));
+    EXPECT_FALSE(service->GetReplicaList("b", TenantId::Default()));
+    {
+        MasterServiceTestPeer::MetadataAccessorRO object(
+            service.get(), {TenantId::Default(), "b"});
+        EXPECT_FALSE(object.Get().IsLeaseExpired());
+    }
+    ASSERT_TRUE(service->ReMountSegment({second.memory->segment}, UUID(5, 6)));
+    EXPECT_TRUE(service->GetReplicaList("b", TenantId::Default()));
+}
+
+TEST(PreparedStandbyStateTest,
+     MixedRemountFailureRetainsPreparedAllocatorForRetry) {
+    auto config = Config();
+    config.memory_allocator = BufferAllocatorType::CACHELIB;
+    PreparedStandbyState prepared(config);
+    StandbyMetadataStore store;
+    StandbySegmentRegistry registry;
+    auto fast = PreparedMemorySegment();
+    auto legacy = MemorySegment("legacy");
+    registry.OnSegmentMount(fast);
+    registry.OnSegmentMount(legacy);
+    store.PutMetadata("default", "fast",
+                      PreparedMemoryObject(1, fast.memory->segment.base, fast));
+    store.PutMetadata("default", "legacy",
+                      MemoryObject(2, 0x200000001, "legacy"));
+    ASSERT_EQ(ErrorCode::OK, prepared.Bootstrap(store, registry, {1, 2}, 1));
+    Segment old;
+    old.id = {7, 8};
+    old.name = old.te_endpoint = "legacy";
+    old.base = 0x200000000;
+    old.size = legacy.capacity;
+    auto service = prepared.Service();
+    EXPECT_FALSE(
+        service->ReMountSegment({fast.memory->segment, old}, UUID(5, 6)));
+    EXPECT_FALSE(service->GetReplicaList("fast", TenantId::Default()));
+    {
+        MasterServiceTestPeer::MetadataAccessorRO object(
+            service.get(), {TenantId::Default(), "fast"});
+        EXPECT_FALSE(object.Get().GetAllReplicas()[0].has_invalid_mem_handle());
+    }
+    ASSERT_TRUE(service->ReMountSegment({fast.memory->segment}, UUID(5, 6)));
+    EXPECT_TRUE(service->GetReplicaList("fast", TenantId::Default()));
+}
+
+TEST(PreparedStandbyStateTest, ReplacedMemoryIncarnationDropsOldReplicas) {
+    PreparedStandbyState prepared(Config());
+    StandbyMetadataStore store;
+    StandbySegmentRegistry registry;
+    auto info = PreparedMemorySegment();
+    registry.OnSegmentMount(info);
+    store.PutMetadata("default", "old",
+                      PreparedMemoryObject(1, info.memory->segment.base, info));
+    ASSERT_EQ(ErrorCode::OK, prepared.Bootstrap(store, registry, {1, 1}, 1));
+    registry.OnSegmentUnmount(info.transport_endpoint, info.memory->segment.id);
+    info.memory->segment.id.second++;
+    registry.OnSegmentUpdate(info);
+    ASSERT_EQ(ErrorCode::OK, prepared.Synchronize(store, registry, {2, 2}));
+    EXPECT_FALSE(Published(*prepared.Service(), "old"));
+    store.PutMetadata("default", "new",
+                      PreparedMemoryObject(2, info.memory->segment.base, info));
+    ASSERT_EQ(ErrorCode::OK, prepared.Synchronize(store, registry, {3, 3}));
+    ASSERT_TRUE(
+        prepared.Service()->ReMountSegment({info.memory->segment}, UUID(5, 6)));
+    EXPECT_TRUE(prepared.Service()->GetReplicaList("new", TenantId::Default()));
 }
 
 TEST(PreparedStandbyStateTest, OverlappingTailNeverBecomesReady) {
@@ -305,6 +536,65 @@ TEST(PreparedStandbyStateTest, MissingRepairWriterCannotActivateTerm) {
     EXPECT_TRUE(prepared.ReadyAt({1, 1}));
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, prepared.BindTerm(config));
     EXPECT_TRUE(store.GetMetadata("default", "key"));
+}
+
+TEST(PreparedStandbyStateTest, RegionsSharingEndpointRemountIndependently) {
+    PreparedStandbyState prepared(Config());
+    StandbyMetadataStore store;
+    StandbySegmentRegistry registry;
+    auto first = PreparedMemorySegment("shared", 0x100000000);
+    auto second = PreparedMemorySegment("shared", 0x200000000);
+    registry.OnSegmentMount(first);
+    registry.OnSegmentMount(second);
+    ASSERT_EQ(2u, registry.GetAllSegments().size());
+    store.PutMetadata(
+        "default", "first",
+        PreparedMemoryObject(1, first.memory->segment.base, first));
+    store.PutMetadata(
+        "default", "second",
+        PreparedMemoryObject(2, second.memory->segment.base, second));
+    ASSERT_EQ(ErrorCode::OK, prepared.Bootstrap(store, registry, {1, 2}, 1));
+    auto service = prepared.Service();
+    ASSERT_TRUE(service->ReMountSegment({first.memory->segment}, UUID(5, 6)));
+    EXPECT_TRUE(service->GetReplicaList("first", TenantId::Default()));
+    EXPECT_FALSE(service->GetReplicaList("second", TenantId::Default()));
+    // Clients retry the complete region list, including already active regions.
+    ASSERT_TRUE(service->ReMountSegment(
+        {first.memory->segment, second.memory->segment}, UUID(5, 6)));
+    EXPECT_TRUE(service->GetReplicaList("first", TenantId::Default()));
+    EXPECT_TRUE(service->GetReplicaList("second", TenantId::Default()));
+    EXPECT_EQ(2u, prepared.PreparedObjects());
+}
+
+TEST(PreparedStandbyStateTest, RegionTopologyChangePreservesSiblingRuntime) {
+    PreparedStandbyState prepared(Config());
+    StandbyMetadataStore store;
+    StandbySegmentRegistry registry;
+    auto first = PreparedMemorySegment("shared", 0x100000000);
+    auto second = PreparedMemorySegment("shared", 0x200000000);
+    registry.OnSegmentMount(first);
+    registry.OnSegmentMount(second);
+    store.PutMetadata(
+        "default", "first",
+        PreparedMemoryObject(1, first.memory->segment.base, first));
+    store.PutMetadata(
+        "default", "second",
+        PreparedMemoryObject(2, second.memory->segment.base, second));
+    ASSERT_EQ(ErrorCode::OK, prepared.Bootstrap(store, registry, {1, 2}, 1));
+    auto service = prepared.Service();
+    auto allocator = MasterServiceTestPeer::PreparedMemorySegments(*service)
+                         .at(second.memory->segment.id)
+                         ->allocator;
+    registry.OnSegmentUnmount("shared", first.memory->segment.id);
+    ASSERT_EQ(ErrorCode::OK, prepared.Synchronize(store, registry, {2, 3}));
+    EXPECT_EQ(3u, prepared.PreparedObjects());
+    EXPECT_FALSE(Published(*service, "first"));
+    EXPECT_TRUE(Published(*service, "second"));
+    EXPECT_EQ(allocator, MasterServiceTestPeer::PreparedMemorySegments(*service)
+                             .at(second.memory->segment.id)
+                             ->allocator);
+    ASSERT_TRUE(service->ReMountSegment({second.memory->segment}, UUID(5, 6)));
+    EXPECT_TRUE(service->GetReplicaList("second", TenantId::Default()));
 }
 
 class PreparedTenantStandbyTest : public MasterServiceTest {};

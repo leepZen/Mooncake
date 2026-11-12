@@ -38,6 +38,7 @@
 #include "config/master_metadata_config.h"
 #include "environ.h"
 #include "segment.h"
+#include "segment_allocator_registration.h"
 #include "segment/region_driver.h"
 // nof_runtime.h is compiled unconditionally (returns a null initiator in
 // non-USE_NOF builds); MasterService::DefaultProbeNofSegment relies on that.
@@ -746,6 +747,13 @@ MasterService::DeleteTenantQuotaPolicy(const TenantId& tenant_id) {
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    bool awaiting_prepared_remount;
+    {
+        std::shared_lock lock(master_state_mutex_);
+        awaiting_prepared_remount =
+            prepared_memory_segments_.contains(segment.id);
+    }
+    if (awaiting_prepared_remount) return ReMountSegment({segment}, client_id);
     ErrorCode mount_result = ErrorCode::INTERNAL_ERROR;
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
@@ -799,6 +807,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         op.transport_endpoint = segment.te_endpoint;
         op.capacity = segment.size;
         op.is_memory_segment = true;
+        op.memory = MemorySegmentOp{segment, client_id};
         op.file_path.clear();
         auto bytes = struct_pack::serialize(op);
         PersistSegmentOpForHAOrEnqueue("MountSegment", OpType::SEGMENT_MOUNT,
@@ -856,8 +865,33 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
 
 ErrorCode MasterService::ValidateStandbyRemountSegment(
     const Segment& segment) const {
+    const auto matches = [&](const Segment& expected) {
+        return expected.id == segment.id && expected.name == segment.name &&
+               expected.base == segment.base && expected.size == segment.size &&
+               expected.te_endpoint == segment.te_endpoint &&
+               expected.protocol == segment.protocol &&
+               expected.host_id == segment.host_id &&
+               (!expected.locality || !segment.locality ||
+                *expected.locality == *segment.locality);
+    };
+    auto prepared = prepared_memory_segments_.find(segment.id);
+    if (prepared != prepared_memory_segments_.end()) {
+        const auto& expected = prepared->second->metadata.segment;
+        return matches(expected) ? ErrorCode::OK : ErrorCode::INVALID_PARAMS;
+    }
     const StandbySegmentInfo* match = nullptr;
+    bool known_memory_endpoint = false;
     for (const auto& standby : standby_memory_segments_) {
+        if (standby.memory) {
+            if (standby.memory->segment.id == segment.id)
+                return matches(standby.memory->segment)
+                           ? ErrorCode::OK
+                           : ErrorCode::INVALID_PARAMS;
+            known_memory_endpoint |=
+                standby.transport_endpoint == segment.te_endpoint ||
+                standby.segment_name == segment.name;
+            continue;
+        }
         if (standby.transport_endpoint == segment.te_endpoint ||
             standby.segment_name == segment.name) {
             if (match != nullptr && match != &standby) {
@@ -866,6 +900,7 @@ ErrorCode MasterService::ValidateStandbyRemountSegment(
             match = &standby;
         }
     }
+    if (known_memory_endpoint && !match) return ErrorCode::INVALID_PARAMS;
     if (match != nullptr && segment.protocol == "cxl") {
         return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
     }
@@ -913,6 +948,14 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         {
             auto segment_access = segment_manager_.getSegmentAccess();
             for (const auto& segment : segments) {
+                auto prepared = prepared_memory_segments_.find(segment.id);
+                if (prepared != prepared_memory_segments_.end() &&
+                    (prepared->second->metadata.owner_client_id != client_id ||
+                     prepared->second->registration->client_liveness_ !=
+                         record)) {
+                    discard_provisional_record();
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
                 auto standby_validation =
                     ValidateStandbyRemountSegment(segment);
                 if (standby_validation != ErrorCode::OK) {
@@ -927,7 +970,11 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 }
             }
         }
-        if (ok_client_.contains(client_id)) {
+        if (ok_client_.contains(client_id) &&
+            std::none_of(
+                segments.begin(), segments.end(), [&](const Segment& segment) {
+                    return prepared_memory_segments_.contains(segment.id);
+                })) {
             LOG(WARNING) << "client_id=" << client_id
                          << ", warn=client_already_remounted";
             // Return OK because this is an idempotent operation
@@ -966,6 +1013,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                     LOG(ERROR) << "segment_name=" << segments[i].name
                                << ", error=remount_rollback_commit_failed";
                 }
+                auto prepared = prepared_memory_segments_.find(segments[i].id);
+                if (prepared != prepared_memory_segments_.end())
+                    prepared->second->registration->SetAvailable(false);
             }
         };
         auto fail_remount =
@@ -984,11 +1034,24 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                     segment_access.GetAllocator(segments[i].id) != nullptr;
             }
 
-            remount_error =
-                segment_access.ReMountSegment(segments, client_id, record);
+            for (const auto& segment : segments) {
+                auto prepared = prepared_memory_segments_.find(segment.id);
+                if (prepared != prepared_memory_segments_.end())
+                    remount_error = segment_access.MountSegment(
+                        segment, client_id, record,
+                        prepared->second->registration);
+                else
+                    remount_error = segment_access.ReMountSegment(
+                        {segment}, client_id, record);
+                if (remount_error == ErrorCode::SEGMENT_ALREADY_EXISTS)
+                    remount_error = ErrorCode::OK;
+                if (remount_error != ErrorCode::OK) break;
+            }
             if (remount_error == ErrorCode::OK) {
                 segment_access.BindClientLiveness(client_id, record);
                 for (const auto& segment : segments) {
+                    if (prepared_memory_segments_.contains(segment.id))
+                        continue;
                     auto allocator = segment_access.GetAllocator(segment.id);
                     Segment authoritative;
                     if (!allocator ||
@@ -1016,10 +1079,12 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         // until the repair below: the replicas this walk collects stay put,
         // and each object it touched is locked again there by its publication.
         std::vector<std::pair<TenantId, route::ObjectRef>> affected_objects;
-        bool any_standby_kept_alive = std::any_of(
-            segments.begin(), segments.end(), [this](const Segment& segment) {
-                return standby_accounted_memory_bytes_.contains(segment.name);
-            });
+        bool any_standby_kept_alive =
+            std::any_of(restores.begin(), restores.end(),
+                        [this](const SegmentRestore& restore) {
+                            return standby_accounted_memory_bytes_.contains(
+                                restore.segment.name);
+                        });
         if (any_standby_kept_alive) {
             const auto collect =
                 [&](const TenantId& tenant_id, ObjectMetadata& metadata,
@@ -1080,7 +1145,8 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 };
             if (standby_replica_index_complete_) {
                 std::map<StandbyObjectKey, route::ObjectRef> candidates;
-                for (const auto& segment : segments) {
+                for (const auto& restore : restores) {
+                    const auto& segment = restore.segment;
                     for (const auto& alias :
                          {segment.name, segment.te_endpoint}) {
                         auto found = standby_replica_index_.find(alias);
@@ -1222,9 +1288,27 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             }
         }
 
+        // All legacy imports and allocator replacements have succeeded. Each
+        // prepared registration publishes the buffers already bound to it.
+        for (const auto& segment : segments) {
+            auto prepared = prepared_memory_segments_.find(segment.id);
+            if (prepared == prepared_memory_segments_.end()) continue;
+            prepared->second->remount_lease->GrantReadLease(
+                std::chrono::milliseconds(default_kv_lease_ttl_));
+            auto access = segment_manager_.getSegmentAccess();
+            access.ActivatePreparedSegment(segment.id);
+            invalid_replica_endpoints_.erase(segment.te_endpoint);
+            invalid_replica_endpoints_.erase(segment.name);
+            prepared_memory_segments_.erase(prepared);
+        }
+
         // Change the client status to OK
-        ok_client_.insert(client_id);
-        MasterMetricManager::instance().inc_active_clients();
+        const auto observation =
+            remount_guard->Observe(ClientLivenessRecord::Clock::now());
+        if (observation == ClientLivenessObservation::RECOVERED_ACTIVE)
+            MasterMetricManager::instance().client_liveness_recovered();
+        if (ok_client_.insert(client_id).second)
+            MasterMetricManager::instance().inc_active_clients();
     }
 
     if (enable_oplog_ && ordered_oplog_writer_) {
@@ -1234,6 +1318,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             op.transport_endpoint = seg.te_endpoint;
             op.capacity = seg.size;
             op.is_memory_segment = true;
+            op.memory = MemorySegmentOp{seg, client_id};
             op.file_path.clear();
             auto bytes = struct_pack::serialize(op);
             PersistSegmentOpForHAOrEnqueue(
@@ -2830,7 +2915,9 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
 
             if (enable_oplog_ && ordered_oplog_writer_ &&
                 !it->transport_endpoint.empty()) {
-                SegmentUnmountOp op{it->transport_endpoint};
+                SegmentUnmountOp op;
+                op.transport_endpoint = it->transport_endpoint;
+                op.memory_segment_id = it->segment_id;
                 auto bytes = struct_pack::serialize(op);
                 auto persist_result = AppendOpLogVisibleBeforeDurable(
                     OpType::SEGMENT_UNMOUNT, TenantId::Default().value(),
@@ -2957,7 +3044,9 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     }
 
     if (enable_oplog_ && ordered_oplog_writer_ && !te_endpoint.empty()) {
-        SegmentUnmountOp op{te_endpoint};
+        SegmentUnmountOp op;
+        op.transport_endpoint = te_endpoint;
+        op.memory_segment_id = segment_id;
         auto bytes = struct_pack::serialize(op);
         PersistSegmentOpForHAOrEnqueue("UnmountSegment",
                                        OpType::SEGMENT_UNMOUNT, te_endpoint,

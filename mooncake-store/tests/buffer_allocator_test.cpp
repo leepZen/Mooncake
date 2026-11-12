@@ -28,6 +28,80 @@ LiveAllocation ToLiveAllocation(uintptr_t base,
 
 }  // namespace
 
+TEST(RestoredMemoryAllocatorTest,
+     ReservationsSplitMergeAndRejectOverlappingRanges) {
+    Segment segment;
+    segment.name = segment.te_endpoint = "restored";
+    segment.base = 0x100000;
+    segment.size = 4096;
+    auto allocator = std::make_shared<RestoredMemoryAllocator>(segment);
+    AllocatedBuffer::Descriptor descriptor{512, segment.base + 1024, "tcp",
+                                           "restored"};
+    auto middle = allocator->ReserveAt(descriptor);
+    ASSERT_TRUE(middle);
+    EXPECT_FALSE(allocator->ReserveAt(descriptor));
+    auto overlap = descriptor;
+    overlap.buffer_address_ -= 256;
+    EXPECT_FALSE(allocator->ReserveAt(overlap));
+    auto outside = descriptor;
+    outside.buffer_address_ = segment.base + segment.size - 128;
+    EXPECT_FALSE(allocator->ReserveAt(outside));
+    EXPECT_EQ(512u, allocator->size());
+    auto first = allocator->allocate(1024);
+    ASSERT_TRUE(first);
+    EXPECT_EQ(segment.base, reinterpret_cast<uintptr_t>(first->data()));
+    middle.reset();
+    auto reused = allocator->ReserveAt(descriptor);
+    ASSERT_TRUE(reused);
+    first.reset();
+    reused.reset();
+    EXPECT_EQ(0u, allocator->size());
+    EXPECT_EQ(segment.size, allocator->getLargestFreeRegion());
+    auto all = allocator->allocate(segment.size);
+    ASSERT_TRUE(all);
+    EXPECT_FALSE(allocator->allocate(1));
+}
+
+TEST(RestoredMemoryAllocatorTest,
+     ConcurrentAllocationsAndFreesPreserveAccounting) {
+    Segment segment;
+    segment.name = segment.te_endpoint = "concurrent-restored";
+    segment.base = 0x100000;
+    segment.size = 1024 * 1024;
+    auto allocator = std::make_shared<RestoredMemoryAllocator>(segment);
+    std::vector<std::thread> workers;
+    for (int worker = 0; worker < 8; ++worker)
+        workers.emplace_back([&] {
+            for (int i = 0; i < 500; ++i) {
+                auto allocation = allocator->allocate(1024);
+                EXPECT_TRUE(allocation);
+            }
+        });
+    for (auto& worker : workers) worker.join();
+    EXPECT_EQ(0u, allocator->size());
+    EXPECT_EQ(segment.size, allocator->getLargestFreeRegion());
+}
+
+TEST(RestoredMemoryAllocatorTest, AlignedAllocationSkipsUnusableFreeRanges) {
+    Segment segment;
+    segment.name = segment.te_endpoint = "unaligned-restored";
+    segment.base = 0x100001;
+    segment.size = 191;
+    auto allocator = std::make_shared<RestoredMemoryAllocator>(segment);
+    auto reserved = allocator->ReserveAt(
+        {1, segment.base + 64, "tcp", segment.te_endpoint});
+    ASSERT_TRUE(reserved);
+    EXPECT_EQ(64u, allocator->getLargestFreeRegion());
+    auto allocation = allocator->allocate(1);
+    ASSERT_TRUE(allocation);
+    EXPECT_EQ(0x100080u, reinterpret_cast<uintptr_t>(allocation->data()));
+    EXPECT_FALSE(allocator->allocate(1));
+    allocation.reset();
+    reserved.reset();
+    EXPECT_EQ(128u, allocator->getLargestFreeRegion());
+    EXPECT_TRUE(allocator->allocate(128));
+}
+
 // Test fixture for BufferAllocator tests
 class BufferAllocatorTest : public ::testing::Test {
    protected:
